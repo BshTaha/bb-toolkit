@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""bb-verify <program> [--checks all] [--threads 20] [--rate 0.0]
+
+Actively PROVES candidate bugs before they ever reach Discord. Everything this
+emits is confidence=confirmed, so you never open a report that turns out to be
+a soft-404 or an unreflected parameter.
+
+Checks: redirect, cors, files, takeover
+Writes targets/<program>/state/verified.jsonl  (bb-triage picks it up)
+"""
+import os, sys, json, time, hashlib, random, string, argparse, socket, subprocess
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+try:
+    import urllib.request
+except ImportError:
+    sys.exit("stdlib missing")
+
+BB = os.environ.get("BB", os.path.expanduser("~/bugbounty"))
+TARGETS = os.environ.get("TARGETS", f"{BB}/targets")
+UA = "Mozilla/5.0 (compatible; bugbounty-recon)"
+
+# A canary we do not control and which cannot receive data — purely a marker
+# that the redirect left the origin. Never point a live payload at a real host.
+CANARY = "example.com"
+CORS_ORIGIN = "https://bb-canary.example.com"
+
+RATE = 0.0
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def fid(*p):
+    return hashlib.sha1("|".join(map(str, p)).encode()).hexdigest()[:16]
+
+
+def fetch(url, headers=None, timeout=10, redirect=False, method="GET"):
+    """Return (status, headers_dict, body_bytes) or None."""
+    if RATE:
+        time.sleep(RATE)
+    h = {"User-Agent": UA}
+    h.update(headers or {})
+
+    class NoRedir(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    op = urllib.request.build_opener(*([] if redirect else [NoRedir]))
+    req = urllib.request.Request(url, headers=h, method=method)
+    try:
+        with op.open(req, timeout=timeout) as r:
+            return r.status, dict(r.headers), r.read(65536)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, dict(e.headers), e.read(65536)
+        except Exception:
+            return e.code, dict(getattr(e, "headers", {}) or {}), b""
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------------ redirect
+REDIR_PAYLOADS = [f"https://{CANARY}", f"//{CANARY}", f"https:/\\/\\{CANARY}",
+                  f"/\\{CANARY}", f"https://{CANARY}%2f%2e%2e"]
+REDIR_PARAMS = {"redirect", "url", "next", "dest", "destination", "redir", "return",
+                "returnto", "return_to", "continue", "goto", "callback", "forward",
+                "r", "u", "target", "to", "rurl", "redirect_uri", "redirect_url"}
+
+
+def check_redirect(url):
+    try:
+        p = urllib.parse.urlsplit(url)
+        qs = urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+    except Exception:
+        return None
+    hits = [k for k, _ in qs if k.lower() in REDIR_PARAMS]
+    if not hits:
+        return None
+    for param in hits[:2]:
+        for pay in REDIR_PAYLOADS:
+            new = [(k, pay if k == param else v) for k, v in qs]
+            test = urllib.parse.urlunsplit(
+                (p.scheme, p.netloc, p.path, urllib.parse.urlencode(new, safe="/\\:"), ""))
+            r = fetch(test)
+            if not r:
+                continue
+            st, hd, _ = r
+            loc = hd.get("Location") or hd.get("location") or ""
+            if st in (301, 302, 303, 307, 308) and loc:
+                host = urllib.parse.urlsplit(
+                    loc if "://" in loc else "http:" + loc if loc.startswith("//") else loc).netloc
+                if CANARY in host:
+                    return dict(
+                        id=fid("redirect", p.netloc, p.path, param), ts=now(),
+                        severity="medium", cls="open-redirect",
+                        title=f"Open redirect via `{param}` on {p.netloc}",
+                        target=test,
+                        evidence=f"HTTP {st} -> Location: {loc[:250]}",
+                        repro=f"curl -sI '{test}' | grep -i location",
+                        source="bb-verify:redirect", confidence="confirmed",
+                        tags="open-redirect")
+    return None
+
+
+# ---------------------------------------------------------------------- cors
+def check_cors(origin_url):
+    r = fetch(origin_url, headers={"Origin": CORS_ORIGIN})
+    if not r:
+        return None
+    _st, hd, _ = r
+    acao = hd.get("Access-Control-Allow-Origin", "") or hd.get("access-control-allow-origin", "")
+    acac = (hd.get("Access-Control-Allow-Credentials", "")
+            or hd.get("access-control-allow-credentials", "")).lower()
+    if not acao:
+        return None
+    reflected = CORS_ORIGIN in acao
+    wildcard = acao.strip() == "*"
+    if reflected and acac == "true":
+        sev, why = "high", "arbitrary origin reflected WITH credentials"
+    elif reflected:
+        sev, why = "medium", "arbitrary origin reflected (no credentials)"
+    elif wildcard and acac == "true":
+        sev, why = "medium", "wildcard origin with credentials"
+    else:
+        return None
+    return dict(
+        id=fid("cors", origin_url), ts=now(), severity=sev, cls="cors",
+        title=f"CORS misconfiguration — {why}",
+        target=origin_url,
+        evidence=f"Origin: {CORS_ORIGIN}\nACAO: {acao}\nACAC: {acac or '(unset)'}",
+        repro=f"curl -sI -H 'Origin: {CORS_ORIGIN}' '{origin_url}' | grep -i access-control",
+        source="bb-verify:cors", confidence="confirmed", tags="cors")
+
+
+# --------------------------------------------------------------------- files
+# (path, required byte signature, severity, label)
+FILES = [
+    ("/.git/config",            b"[core]",              "critical", "Exposed .git/config"),
+    ("/.git/HEAD",              b"ref:",                "critical", "Exposed .git repository"),
+    ("/.env",                   b"=",                   "critical", "Exposed .env file"),
+    ("/.aws/credentials",       b"aws_access_key",      "critical", "Exposed AWS credentials"),
+    ("/.svn/entries",           b"dir",                 "high",     "Exposed .svn"),
+    ("/actuator/env",           b"propertySources",     "high",     "Spring Actuator /env"),
+    ("/actuator/heapdump",      b"",                    "critical", "Spring Actuator heapdump"),
+    ("/server-status",          b"Apache Server Status","medium",   "Apache mod_status"),
+    ("/.DS_Store",              b"Bud1",                "low",       "Exposed .DS_Store"),
+    ("/telescope/requests",     b"Telescope",           "high",     "Laravel Telescope exposed"),
+    ("/debug/pprof/",           b"profiles",            "medium",   "Go pprof debug endpoint"),
+    ("/phpinfo.php",            b"phpinfo()",           "medium",   "phpinfo() exposed"),
+    ("/.well-known/security.txt", b"", "info", "security.txt"),  # informational, filtered later
+]
+
+
+def check_files(base):
+    base = base.rstrip("/")
+    # Soft-404 baseline: a path that cannot legitimately exist.
+    rnd = "".join(random.choices(string.ascii_lowercase, k=18))
+    b = fetch(f"{base}/{rnd}")
+    base_len, base_st = (len(b[2]), b[0]) if b else (0, 404)
+    out = []
+    for path, sig, sev, label in FILES:
+        if sev == "info":
+            continue
+        r = fetch(base + path)
+        if not r:
+            continue
+        st, _hd, body = r
+        if st != 200 or not body:
+            continue
+        # kill soft-404s: same status AND near-identical length as the random path
+        if st == base_st and abs(len(body) - base_len) < 48:
+            continue
+        if sig and sig.lower() not in body.lower():
+            continue
+        out.append(dict(
+            id=fid("file", base, path), ts=now(), severity=sev,
+            cls="exposed-file", title=f"{label} on {urllib.parse.urlsplit(base).netloc}",
+            target=base + path,
+            evidence=f"HTTP 200, {len(body)}B, signature {sig[:24]!r} matched\n"
+                     + body[:220].decode("utf-8", "replace"),
+            repro=f"curl -s '{base}{path}' | head -20",
+            source="bb-verify:files", confidence="confirmed", tags="exposure"))
+    return out
+
+
+# ------------------------------------------------------------------ takeover
+FINGERPRINTS = {
+    "s3.amazonaws.com": "NoSuchBucket", "cloudfront.net": None,
+    "github.io": "There isn't a GitHub Pages site here",
+    "herokuapp.com": "No such app", "herokudns.com": "No such app",
+    "wordpress.com": "Do you want to register",
+    "pantheonsite.io": "The gods are wise",
+    "domains.tumblr.com": "Whatever you were looking for doesn't currently exist",
+    "zendesk.com": "Help Center Closed", "helpscoutdocs.com": "No settings were found",
+    "ghost.io": "Domain error", "fastly.net": "Fastly error: unknown domain",
+    "surge.sh": "project not found", "bitbucket.io": "Repository not found",
+    "netlify.app": "Not Found", "readme.io": "Project doesnt exist",
+    "statuspage.io": "You are being redirected", "unbouncepages.com": "The requested URL was not found",
+    "azurewebsites.net": None, "cloudapp.net": None, "trafficmanager.net": None,
+}
+
+
+def dig_cname(host):
+    try:
+        out = subprocess.run(["dig", "+short", "CNAME", host],
+                             capture_output=True, text=True, timeout=8).stdout.strip()
+        return [l.strip(".") for l in out.splitlines() if l.strip()]
+    except Exception:
+        return []
+
+
+def check_takeover(host):
+    cnames = dig_cname(host)
+    if not cnames:
+        return None
+    for cn in cnames:
+        for svc, sig in FINGERPRINTS.items():
+            if not cn.endswith(svc):
+                continue
+            # Does the CNAME target itself resolve?
+            try:
+                socket.gethostbyname(cn)
+                dangling = False
+            except Exception:
+                dangling = True
+            body = b""
+            for scheme in ("https", "http"):
+                r = fetch(f"{scheme}://{host}/", timeout=8, redirect=True)
+                if r:
+                    body = r[2]
+                    break
+            sig_hit = bool(sig) and sig.lower().encode() in body.lower()
+            if not (dangling or sig_hit):
+                continue
+            why = "CNAME target does not resolve (NXDOMAIN)" if dangling \
+                  else f"service fingerprint matched: {sig!r}"
+            return dict(
+                id=fid("takeover", host), ts=now(), severity="critical",
+                cls="subdomain-takeover",
+                title=f"Subdomain takeover: {host} → {svc}",
+                target=host,
+                evidence=f"CNAME: {cn}\n{why}\n" + body[:200].decode("utf-8", "replace"),
+                repro=f"dig CNAME {host} +short ; curl -s https://{host}/ | head -20",
+                source="bb-verify:takeover", confidence="confirmed", tags="takeover")
+    return None
+
+
+# ---------------------------------------------------------------------- main
+def load(p, limit=None):
+    if not os.path.exists(p):
+        return []
+    v = [l.strip() for l in open(p, errors="ignore") if l.strip()]
+    return v[:limit] if limit else v
+
+
+def main():
+    global RATE
+    ap = argparse.ArgumentParser()
+    ap.add_argument("program")
+    ap.add_argument("--checks", default="all")
+    ap.add_argument("--threads", type=int, default=20)
+    ap.add_argument("--rate", type=float, default=0.0,
+                    help="seconds to sleep before each request (politeness)")
+    ap.add_argument("--max", type=int, default=1500, help="cap candidates per check")
+    a = ap.parse_args()
+    RATE = a.rate
+
+    d = f"{TARGETS}/{a.program}"
+    if not os.path.isdir(d):
+        sys.exit(f"!! no workspace {d}")
+    os.makedirs(f"{d}/state", exist_ok=True)
+    want = {c.strip() for c in a.checks.split(",")} if a.checks != "all" else \
+        {"redirect", "cors", "files", "takeover"}
+
+    jobs = []
+    if "redirect" in want:
+        for u in load(f"{d}/urls/openredirect_candidates.txt", a.max):
+            jobs.append(("redirect", check_redirect, u))
+    if "cors" in want:
+        for u in load(f"{d}/recon/live.txt", min(a.max, 400)):
+            jobs.append(("cors", check_cors, u))
+    if "files" in want:
+        for u in load(f"{d}/recon/live.txt", min(a.max, 400)):
+            jobs.append(("files", check_files, u))
+    if "takeover" in want:
+        for h in load(f"{d}/recon/subdomains.txt", a.max):
+            jobs.append(("takeover", check_takeover, h))
+
+    if not jobs:
+        print("[verify] no candidates — run bb-recon / bb-urls first")
+        return 0
+
+    print(f"[verify] {len(jobs)} checks across {sorted(want)} "
+          f"({a.threads} threads, rate={a.rate}s)")
+    results, done, counts = [], 0, {}
+    with ThreadPoolExecutor(max_workers=a.threads) as ex:
+        futs = {ex.submit(fn, arg): kind for kind, fn, arg in jobs}
+        for fu in as_completed(futs):
+            done += 1
+            if done % 250 == 0:
+                print(f"    ...{done}/{len(jobs)}")
+            try:
+                r = fu.result()
+            except Exception:
+                continue
+            if not r:
+                continue
+            for item in (r if isinstance(r, list) else [r]):
+                results.append(item)
+                counts[item["cls"]] = counts.get(item["cls"], 0) + 1
+
+    seen = set()
+    path = f"{d}/state/verified.jsonl"
+    if os.path.exists(path):
+        for l in open(path, errors="ignore"):
+            try:
+                seen.add(json.loads(l)["id"])
+            except Exception:
+                pass
+    n = 0
+    with open(path, "a") as fh:
+        for r in results:
+            if r["id"] in seen:
+                continue
+            seen.add(r["id"])
+            r["program"] = a.program
+            fh.write(json.dumps(r) + "\n")
+            n += 1
+    for k, v in sorted(counts.items()):
+        print(f"    {k:<20} {v}")
+    print(f"[verify] {n} newly CONFIRMED -> {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

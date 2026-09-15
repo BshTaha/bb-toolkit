@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# bb-hunt <program> [options] — the all-night autonomous hunt loop.
+#
+#   recon -> scope-filter -> urls -> js secrets -> VERIFY -> nuclei -> triage -> Discord
+#
+# Cycle 1 is a full sweep. Later cycles re-enumerate, diff for NEW assets, and
+# scan those hard (new assets are where the unclaimed bugs are), with a full
+# re-sweep every --full-every cycles.
+#
+# Options:
+#   --loop               keep hunting until stopped
+#   --interval  <sec>    sleep between cycles           (default 3600)
+#   --full-every <n>     full re-sweep every n cycles   (default 6)
+#   --min  <sev>         min severity pushed to Discord (default medium)
+#   --rate <n>           requests/sec ceiling           (default 100)
+#   --threads <n>        concurrency                    (default 20)
+#   --ping <text>        prepend on high/critical, e.g. '<@1234>'
+#   --dast               also run nuclei fuzzing templates against params
+#   --brute <mode>       keyless DNS bruteforce: off|fast|deep|max (default fast)
+#                        delta cycles use fast; FULL cycles use the mode you set
+#   --no-discord         local only
+#   --heartbeat          post a cycle summary even with zero findings
+set -uo pipefail
+
+P="${1:-}"; [ -z "$P" ] && { sed -n '2,22p' "$0" | sed 's/^# \?//'; exit 1; }; shift
+
+LOOP=0; INTERVAL=3600; FULL_EVERY=6; MIN=medium; RATE=100; THREADS=20
+PING=""; DAST=0; DISCORD=1; HEARTBEAT=0; BRUTE=fast
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --loop) LOOP=1;; --interval) INTERVAL="$2"; shift;;
+    --full-every) FULL_EVERY="$2"; shift;; --min) MIN="$2"; shift;;
+    --rate) RATE="$2"; shift;; --threads) THREADS="$2"; shift;;
+    --ping) PING="$2"; shift;; --dast) DAST=1;;
+    --no-discord) DISCORD=0;; --heartbeat) HEARTBEAT=1;;
+    --brute) BRUTE="$2"; shift;;
+    *) echo "unknown option: $1"; exit 1;;
+  esac; shift
+done
+
+: "${BB:=$HOME/bugbounty}"; : "${TARGETS:=$BB/targets}"
+: "${NUCLEI_TEMPLATES:=$BB/data/templates/nuclei-templates}"
+: "${RESOLVERS:=$BB/data/resolvers/resolvers.txt}"
+export BB TARGETS NUCLEI_TEMPLATES RESOLVERS
+D="$TARGETS/$P"
+[ -s "$D/scope/roots.txt" ] || { echo "!! put root domains in $D/scope/roots.txt (bb-new $P <domain>)"; exit 1; }
+mkdir -p "$D"/{scope,recon,urls,scans,loot,state,notes} "$BB/logs"
+
+# Per-program request policy (User-Agent, rate) written by bb-profile.
+# Some programs mandate an identifying UA; others just benefit from one.
+UA_ARGS=()
+if [ -s "$D/scope/profile.env" ]; then
+  # shellcheck disable=SC1090
+  . "$D/scope/profile.env"
+  if [ -n "${BB_UA:-}" ]; then
+    UA_ARGS=(-H "User-Agent: $BB_UA")
+    echo "[profile] UA: $BB_UA"
+  fi
+  [ -n "${BB_RATE:-}" ] && RATE="${BB_RATE}"
+  [ -n "${BB_THREADS:-}" ] && THREADS="${BB_THREADS}"
+fi
+
+LOCK="$D/state/hunt.lock"
+if [ -e "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "!! already hunting $P (pid $(cat "$LOCK"))"; exit 1
+fi
+echo $$ > "$LOCK"; trap 'rm -f "$LOCK"' EXIT INT TERM
+
+say(){ printf '\n\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
+report(){ [ "$DISCORD" = 1 ] && bb-report "$P" --min "$MIN" ${PING:+--ping "$PING"} || true; }
+
+# Drop anything the program declared out of scope. Patterns are plain substrings
+# or regex, one per line, in scope/out-of-scope.txt.
+scope_filter(){
+  local f="$1"; [ -s "$f" ] || return 0
+  [ -s "$D/scope/out-of-scope.txt" ] || return 0
+  local before after
+  before=$(wc -l < "$f")
+  grep -vEf <(grep -vE '^\s*(#|$)' "$D/scope/out-of-scope.txt") "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+  after=$(wc -l < "$f"); rm -f "$f.tmp"
+  [ "$before" != "$after" ] && echo "    scope filter: dropped $((before-after)) out-of-scope entries"
+}
+
+CYCLE=0
+while :; do
+  CYCLE=$((CYCLE+1))
+  START=$(date +%s); TS=$(date +%F_%H%M)
+  FULL=0; [ "$CYCLE" = 1 ] && FULL=1
+  [ "$FULL_EVERY" -gt 0 ] && [ $((CYCLE % FULL_EVERY)) -eq 0 ] && FULL=1
+  say "cycle $CYCLE ($([ $FULL = 1 ] && echo FULL || echo delta)) — $P"
+
+  # ---------------------------------------------------------------- 1. recon
+  say "recon: subdomain enum + resolve + probe"
+  PREV="$D/state/subs_prev.txt"; cp -f "$D/recon/subdomains.txt" "$PREV" 2>/dev/null || : > "$PREV"
+  # Low-quota providers (securitytrails 50/mo, censys 250/mo, bevigil 50/mo...)
+  # would burn a whole month's allowance in ~2 days at one query per hourly
+  # cycle. Spend them only on FULL sweeps; delta cycles ride the unlimited ones.
+  LOWQUOTA="securitytrails,censys,bevigil,whoisxmlapi,intelx,builtwith,binaryedge,dnsdumpster,c99,dnsdb"
+  if [ "$FULL" = 1 ]; then SUBF_ES=""; else SUBF_ES="-es $LOWQUOTA"; fi
+  # shellcheck disable=SC2086
+  subfinder -dL "$D/scope/roots.txt" -all -silent -timeout 25 -max-time 8 $SUBF_ES 2>/dev/null | anew "$D/recon/subdomains.txt" >/dev/null
+  while read -r r; do [ -n "$r" ] && assetfinder --subs-only "$r" 2>/dev/null; done < "$D/scope/roots.txt" \
+    | anew "$D/recon/subdomains.txt" >/dev/null
+  # Keyless discovery — no API, no quota. Finds hosts that never got a cert,
+  # never got crawled, never leaked, so no passive source can know them.
+  if [ "$BRUTE" != "off" ]; then
+    if [ "$FULL" = 1 ]; then
+      bb-brute "$P" --depth "$BRUTE" --perms --rate "$((RATE*30))" 2>&1 | sed 's/^/    /'
+    else
+      bb-brute "$P" --depth fast --rate "$((RATE*30))" 2>&1 | sed 's/^/    /'
+    fi
+  fi
+
+  scope_filter "$D/recon/subdomains.txt"
+  sort -u "$D/recon/subdomains.txt" -o "$D/recon/subdomains.txt"
+
+  comm -13 <(sort "$PREV") <(sort "$D/recon/subdomains.txt") > "$D/recon/new_${TS}.txt"
+  NEW=$(wc -l < "$D/recon/new_${TS}.txt")
+  [ "$NEW" -eq 0 ] && rm -f "$D/recon/new_${TS}.txt"
+  echo "    subdomains: $(wc -l < "$D/recon/subdomains.txt")  (new this cycle: $NEW)"
+
+  dnsx -l "$D/recon/subdomains.txt" -r "$RESOLVERS" -silent -a -resp \
+       -o "$D/recon/resolved.txt" >/dev/null 2>&1
+  cut -d' ' -f1 "$D/recon/resolved.txt" 2>/dev/null | sort -u > "$D/recon/resolved_hosts.txt"
+  httpx "${UA_ARGS[@]}" -l "$D/recon/resolved_hosts.txt" -silent -sc -title -tech-detect -cl -location \
+        -threads "$THREADS" -rl "$RATE" -timeout 8 -retries 1 \
+        -o "$D/recon/live_full.txt" >/dev/null 2>&1
+  grep -oE '^https?://[^ ]+' "$D/recon/live_full.txt" 2>/dev/null | sort -u > "$D/recon/live.txt"
+  scope_filter "$D/recon/live.txt"
+  echo "    live hosts: $(wc -l < "$D/recon/live.txt" 2>/dev/null || echo 0)"
+
+  # What do we scan this cycle? New assets only on delta cycles.
+  SCOPE_FILE="$D/recon/live.txt"
+  if [ "$FULL" = 0 ] && [ "$NEW" -gt 0 ]; then
+    httpx "${UA_ARGS[@]}" -l "$D/recon/new_${TS}.txt" -silent -threads "$THREADS" -rl "$RATE" \
+          -o "$D/state/live_new.txt" >/dev/null 2>&1
+    [ -s "$D/state/live_new.txt" ] && SCOPE_FILE="$D/state/live_new.txt"
+  elif [ "$FULL" = 0 ]; then
+    echo "    no new assets — light re-verify pass only"
+    SCOPE_FILE=""
+  fi
+
+  # -------------------------------------------------------- 2. urls + js
+  if [ "$FULL" = 1 ]; then
+    say "urls: historical + crawl + bucket"
+    bb-urls "$P" 2>&1 | sed 's/^/    /'
+    say "js: secret + endpoint mining"
+    bb-secrets "$P" 2>&1 | tail -6 | sed 's/^/    /'
+  fi
+
+  # ------------------------------------------------- 3. VERIFY (kills FPs)
+  say "verify: proving candidates (redirect / cors / files / takeover)"
+  # bb-verify has its own thread pool with NO rate limit by default — at 20
+  # threads it would blow any per-host budget. Convert --rate into a per-thread
+  # delay so THREADS/DELAY lands on the requested req/s.
+  VDELAY=$(python3 -c "print(round($THREADS/max($RATE,1),3))")
+  bb-verify "$P" --threads "$THREADS" --rate "$VDELAY" 2>&1 | sed 's/^/    /'
+
+  # --------------------------------------------------------- 4. nuclei
+  if [ -n "$SCOPE_FILE" ] && [ -s "$SCOPE_FILE" ]; then
+    say "nuclei: $(wc -l < "$SCOPE_FILE") hosts"
+    nuclei "${UA_ARGS[@]}" -l "$SCOPE_FILE" -t "$NUCLEI_TEMPLATES" \
+      -severity low,medium,high,critical \
+      -rl "$RATE" -c "$THREADS" -timeout 8 -retries 1 -stats -si 120 \
+      -eid ssl-issuer,tech-detect,waf-detect,http-missing-security-headers \
+      -jsonl -o "$D/scans/nuclei_${TS}.jsonl" 2>&1 | tail -3 | sed 's/^/    /'
+
+    if [ "$DAST" = 1 ] && [ -s "$D/urls/params.txt" ]; then
+      say "dast: fuzzing $(wc -l < "$D/urls/params.txt") parameterised URLs"
+      nuclei "${UA_ARGS[@]}" -l "$D/urls/params.txt" -dast -rl "$RATE" -c "$THREADS" \
+        -timeout 10 -stats -si 120 -jsonl -o "$D/scans/nuclei_dast_${TS}.jsonl" 2>&1 \
+        | tail -3 | sed 's/^/    /'
+    fi
+  fi
+
+  # --------------------------------------------------- 5. triage + report
+  say "triage"
+  bb-triage "$P" 2>&1 | sed 's/^/    /'
+  say "report"
+  report
+
+  ELAPSED=$(( $(date +%s) - START ))
+  CRIT=$(grep -c '"severity": "critical"' "$D/state/findings.jsonl" 2>/dev/null || echo 0)
+  HIGH=$(grep -c '"severity": "high"'     "$D/state/findings.jsonl" 2>/dev/null || echo 0)
+  MED=$(grep -c  '"severity": "medium"'   "$D/state/findings.jsonl" 2>/dev/null || echo 0)
+  SUM="**$P** · cycle $CYCLE ($([ $FULL = 1 ] && echo full || echo delta)) done in ${ELAPSED}s — \
+$(wc -l < "$D/recon/subdomains.txt") subs, $NEW new, \
+$(wc -l < "$D/recon/live.txt" 2>/dev/null || echo 0) live · \
+totals: 🔴 $CRIT / 🟠 $HIGH / 🟡 $MED"
+  echo "$SUM" | sed 's/\*\*//g'
+  [ "$DISCORD" = 1 ] && [ "$HEARTBEAT" = 1 ] && bb-report "$P" --summary "$SUM" >/dev/null 2>&1
+
+  [ "$LOOP" = 1 ] || break
+  say "sleeping ${INTERVAL}s before cycle $((CYCLE+1))  (ctrl-c to stop)"
+  sleep "$INTERVAL"
+done
+
+say "hunt finished — findings: $D/state/findings.jsonl"

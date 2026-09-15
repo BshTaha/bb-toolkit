@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# bb-urls <program>  — historical + crawled URLs, deduped, split into juicy buckets
+set -uo pipefail
+[ $# -lt 1 ] && { echo "usage: bb-urls <program>"; exit 1; }
+P="$1"; D="${TARGETS}/$P"; U="$D/urls"
+mkdir -p "$U"; cd "$U"
+
+echo "[1/4] historical URLs (gau)"
+gau --threads 8 --subs $(tr '\n' ' ' < "$D/scope/roots.txt") 2>/dev/null | anew raw.txt >/dev/null
+
+echo "[2/4] active crawl (katana)"
+[ -s "$D/recon/live.txt" ] && katana -list "$D/recon/live.txt" -d 3 -jc -kf all -silent -rl 100 -c 15 2>/dev/null | anew raw.txt >/dev/null
+
+echo "[3/4] dedupe (uro)"
+uro -i raw.txt -o urls.txt 2>/dev/null || sort -u raw.txt > urls.txt
+wc -l < urls.txt | xargs echo "    unique urls:"
+
+echo "[4/4] bucketing"
+grep -E '\?.+=' urls.txt | sort -u > params.txt
+grep -iE '\.js(\?|$)' urls.txt | sort -u > js.txt
+grep -iE '\.(json|xml|yaml|yml|env|sql|bak|old|zip|tar|gz|log|conf|config|ini|pem|key)(\?|$)' urls.txt | sort -u > interesting_files.txt
+grep -iE '(redirect|url|next|dest|destination|redir|return|returnTo|continue|goto|callback|forward)=' params.txt | sort -u > openredirect_candidates.txt
+grep -iE '(id|uid|user|account|order|doc|file|key|num|no|invoice|report)=[0-9]+' params.txt | sort -u > idor_candidates.txt
+grep -iE '(file|path|page|doc|folder|root|template|include|dir|load|read|download)=' params.txt | sort -u > lfi_candidates.txt
+grep -iE '(q|s|search|query|keyword|term|name|message|comment|title|text)=' params.txt | sort -u > xss_candidates.txt
+grep -iE '(url|uri|src|host|target|link|domain|feed|proxy|fetch|site|to|out|view|show|from)=https?' params.txt | sort -u > ssrf_candidates.txt
+wc -l params.txt js.txt interesting_files.txt *_candidates.txt 2>/dev/null | sed 's/^/    /'
+echo "[done] $U"

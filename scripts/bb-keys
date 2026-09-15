@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""bb-keys — manage and validate subfinder/uncover API keys.
+
+  bb-keys list            what's filled, what's empty, ranked by value
+  bb-keys links [tier]    signup URLs + free-tier notes  (tier: 1|2|3|all)
+  bb-keys set <p> <key>   add a key (mirrors into uncover where shared)
+  bb-keys test [p]        live-validate keys against real queries
+  bb-keys rm <p>          remove a key
+"""
+import os, sys, re, subprocess, shutil
+
+BB = os.environ.get("BB", os.path.expanduser("~/bugbounty"))
+CFG = f"{BB}/data/configs/tools/subfinder/provider-config.yaml"
+UNCOVER = f"{BB}/data/configs/tools/uncover/provider-config.yaml"
+# providers uncover also understands -> keep both files in sync
+SHARED = {"shodan", "censys", "fofa", "quake", "zoomeyeapi", "netlas", "criminalip",
+          "publicwww", "hunter", "odin", "binaryedge"}
+
+# tier, provider, free-tier note, signup URL, key format
+PROVIDERS = [
+ (1,"chaos","FREE w/ ProjectDiscovery account. Purpose-built bug-bounty subdomain dataset — single highest-value key here.","https://cloud.projectdiscovery.io","token"),
+ (1,"github","FREE. Classic PAT, NO scopes needed. Mines subdomains out of public code//issues. Add 2-3 tokens comma-separated to dodge rate limits.","https://github.com/settings/tokens","token[,token2]"),
+ (1,"virustotal","FREE 500 lookups/day. Excellent passive DNS.","https://www.virustotal.com/gui/my-apikey","token"),
+ (1,"securitytrails","FREE 50 queries/mo. Small quota, very high quality historical DNS.","https://securitytrails.com/app/account/credentials","token"),
+ (1,"shodan","FREE tier limited; $49 lifetime often on sale. Also powers uncover.","https://account.shodan.io","token"),
+ (2,"censys","FREE 250 queries/mo. Cert-based discovery.","https://search.censys.io/account/api","APP_ID:SECRET"),
+ (2,"fullhunt","FREE tier, generous. Attack-surface DB.","https://fullhunt.io/user/settings","token"),
+ (2,"leakix","FREE. Good for exposed services + subs.","https://leakix.net/settings/api","token"),
+ (2,"netlas","FREE tier. Internet-wide scan data.","https://app.netlas.io/profile","token"),
+ (2,"bevigil","FREE 50/mo. Uniquely mines MOBILE APP binaries for endpoints — finds hosts nothing else sees.","https://bevigil.com/osint-api","token"),
+ (2,"intelx","FREE trial. Leak/paste data.","https://intelx.io/account?tab=developer","host:token  (e.g. 2.intelx.io:KEY)"),
+ (2,"certspotter","FREE tier. CT log monitoring.","https://sslmate.com/account/api_credentials","token"),
+ (2,"alienvault","FREE. OTX passive DNS.","https://otx.alienvault.com/api","token"),
+ (3,"urlscan","FREE. Also yields URLs/screenshots.","https://urlscan.io/user/profile","token"),
+ (3,"binaryedge","FREE tier.","https://app.binaryedge.io/account/api","token"),
+ (3,"zoomeyeapi","FREE tier. Chinese Shodan-alike, different visibility.","https://www.zoomeye.org/profile","token"),
+ (3,"quake","FREE tier (360). Different regional coverage.","https://quake.360.net/quake/#/personal","token"),
+ (3,"fofa","FREE tier. Strong on Asian infra.","https://fofa.info/userInfo","email:token"),
+ (3,"whoisxmlapi","FREE 500/mo.","https://whois.whoisxmlapi.com/","token"),
+ (3,"builtwith","FREE trial. Tech + subdomains.","https://api.builtwith.com/","token"),
+ (3,"dnsdumpster","FREE, now key-gated.","https://dnsdumpster.com/","token"),
+ (3,"bufferover","FREE tier.","https://tls.bufferover.run/","token"),
+ (3,"c99","PAID only.","https://api.c99.nl/","token"),
+ (3,"dnsdb","PAID (Farsight).","https://www.farsightsecurity.com/","token"),
+ (3,"onyphe","FREE tier.","https://www.onyphe.io/login","token"),
+ (3,"robtex","FREE tier.","https://freeapi.robtex.com/","token"),
+ (3,"threatbook","PAID.","https://threatbook.cn/","token"),
+ (3,"redhuntlabs","FREE tier.","https://redhuntlabs.com/","url:token"),
+ (3,"chinaz","FREE tier.","https://my.chinaz.com/ChinazAPI","token"),
+ (3,"driftnet","FREE tier.","https://driftnet.io/","token"),
+ (3,"hunter","FREE tier.","https://hunter.how/","token"),
+]
+BY = {p[1]: p for p in PROVIDERS}
+
+# --- direct API probes: subfinder silently swallows 401s, so never trust it ---
+# provider -> (url_template, headers_fn(key), ok_predicate(status, body))
+def _basic(k):
+    import base64
+    return {"Authorization": "Basic " + base64.b64encode(k.encode()).decode()}
+
+DIRECT = {
+ "chaos":         ("https://dns.projectdiscovery.io/dns/{d}/subdomains", lambda k: {"Authorization": k}),
+ "github":        ("https://api.github.com/user",                        lambda k: {"Authorization": f"token {k}"}),
+ "virustotal":    ("https://www.virustotal.com/api/v3/domains/{d}/subdomains?limit=10", lambda k: {"x-apikey": k}),
+ "securitytrails":("https://api.securitytrails.com/v1/domain/{d}/subdomains",lambda k: {"APIKEY": k}),
+ "shodan":        ("https://api.shodan.io/api-info?key={k}",             lambda k: {}),
+ "censys":        ("https://search.censys.io/api/v1/account",            _basic),
+ "fullhunt":      ("https://fullhunt.io/api/v1/domain/{d}/subdomains",   lambda k: {"X-API-KEY": k}),
+ "leakix":        ("https://leakix.net/api/subdomains/{d}",              lambda k: {"api-key": k}),
+ "netlas":        ("https://app.netlas.io/api/domains/?q=domain:*.{d}&start=0", lambda k: {"X-API-Key": k}),
+ "bevigil":       ("https://osint.bevigil.com/api/{d}/subdomains/",      lambda k: {"X-Access-Token": k}),
+ "certspotter":   ("https://api.certspotter.com/v1/issuances?domain={d}&include_subdomains=true&expand=dns_names", lambda k: {"Authorization": f"Bearer {k}"}),
+ "alienvault":    ("https://otx.alienvault.com/api/v1/indicators/domain/{d}/passive_dns", lambda k: {"X-OTX-API-KEY": k}),
+ "urlscan":       ("https://urlscan.io/user/quotas/",                    lambda k: {"API-Key": k}),
+ "binaryedge":    ("https://api.binaryedge.io/v2/user/subscription",     lambda k: {"X-Key": k}),
+ "whoisxmlapi":   ("https://subdomains.whoisxmlapi.com/api/v1?apiKey={k}&domainName={d}", lambda k: {}),
+}
+TESTDOM = "hackerone.com"
+
+def probe(name, key, timeout=25):
+    """Return (verdict, detail). verdict in ok/bad/quota/unknown."""
+    import json as _json, urllib.request as _u, urllib.error as _e
+    if name not in DIRECT:
+        return "unknown", "no direct probe"
+    tpl, hf = DIRECT[name]
+    url = tpl.format(d=TESTDOM, k=key)
+    try:
+        hdrs = {"User-Agent": "bb-hunt", "Accept": "application/json"}
+        hdrs.update(hf(key))
+        req = _u.Request(url, headers=hdrs)
+        with _u.urlopen(req, timeout=timeout) as r:
+            st, body = r.status, r.read(200000)
+    except _e.HTTPError as e:
+        st, body = e.code, e.read()[:300]
+    except Exception as ex:
+        return "unknown", str(ex)[:90]
+    txt = body.decode("utf-8", "replace")[:300] if isinstance(body, bytes) else str(body)
+    if st in (401, 403):
+        return "bad", f"HTTP {st} {txt.strip()[:110]}"
+    if st == 429:
+        return "quota", f"HTTP 429 rate-limited {txt.strip()[:80]}"
+    if st and 200 <= st < 300:
+        n = None
+        try:
+            d = _json.loads(txt if len(txt) < 290 else body.decode("utf-8", "replace"))
+            for key_name in ("subdomains", "data", "dns_names", "passive_dns", "items", "result"):
+                if isinstance(d, dict) and isinstance(d.get(key_name), list):
+                    n = len(d[key_name]); break
+        except Exception:
+            pass
+        return "ok", f"HTTP 200" + (f", {n} records" if n is not None else "")
+    return "unknown", f"HTTP {st} {txt.strip()[:90]}"
+
+
+G, Y, R, B, DIM, X = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[1;36m", "\033[2m", "\033[0m"
+
+
+def load(path=CFG):
+    d = {}
+    if not os.path.exists(path):
+        return d
+    for line in open(path):
+        m = re.match(r"^([a-zA-Z0-9_]+)\s*:\s*\[(.*)\]\s*$", line.strip())
+        if m:
+            vals = [v.strip().strip('"').strip("'") for v in m.group(2).split(",") if v.strip()]
+            d[m.group(1)] = vals
+    return d
+
+
+def save(d, path=CFG):
+    """Atomic write: a looping bb-hunt may read this file at any moment, and a
+    truncated read would silently drop every provider for that cycle."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        for k in sorted(d):
+            v = ", ".join(f'"{x}"' for x in d[k])
+            f.write(f"{k}: [{v}]\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)   # atomic on POSIX — readers see old or new, never partial
+
+
+def redact(v):
+    return v[:4] + "…" + v[-3:] if len(v) > 12 else "***"
+
+
+def cmd_list():
+    d = load()
+    filled = sum(1 for k, v in d.items() if v)
+    print(f"\n{B}subfinder providers{X}  {G}{filled} configured{X} / {len(d)} slots   {DIM}{CFG}{X}\n")
+    for tier in (1, 2, 3):
+        rows = [p for p in PROVIDERS if p[0] == tier]
+        label = {1: "TIER 1 — do these first", 2: "TIER 2 — strong free tiers",
+                 3: "TIER 3 — diminishing returns"}[tier]
+        print(f" {B}{label}{X}")
+        for _t, name, note, _url, _fmt in rows:
+            v = d.get(name, [])
+            mark = f"{G}✓ {redact(v[0])}{X}" if v else f"{DIM}· empty{X}"
+            print(f"   {name:<16} {mark}")
+        print()
+    missing = [p[1] for p in PROVIDERS if p[0] == 1 and not d.get(p[1])]
+    if missing:
+        print(f" {Y}!{X} Tier-1 still empty: {', '.join(missing)}")
+        print(f"   {DIM}bb-keys links 1{X}\n")
+
+
+def cmd_links(tier="all"):
+    print()
+    for t, name, note, url, fmt in PROVIDERS:
+        if tier != "all" and str(t) != str(tier):
+            continue
+        cur = load().get(name, [])
+        star = f"{G}[configured]{X}" if cur else ""
+        print(f" {B}{name}{X}  {DIM}(tier {t}){X} {star}")
+        print(f"   {note}")
+        print(f"   signup : {url}")
+        print(f"   format : {fmt}")
+        print(f"   add    : bb-keys set {name} <KEY>\n")
+
+
+def cmd_set(name, key):
+    if name not in BY:
+        sys.exit(f"unknown provider '{name}'. try: bb-keys list")
+    fmt = BY[name][4]
+    if ":" in fmt and "," not in fmt and ":" not in key:
+        print(f"{Y}!{X} {name} expects format {B}{fmt}{X} — you gave a bare token. Aborting.")
+        sys.exit(1)
+    d = load()
+    d.setdefault(name, [])
+    vals = [v.strip() for v in key.split(",") if v.strip()]
+    for v in vals:
+        if v not in d[name]:
+            d[name].append(v)
+    save(d)
+    print(f"{G}✓{X} {name} = {redact(vals[0])}" + (f" (+{len(vals)-1} more)" if len(vals) > 1 else ""))
+    if name in SHARED:
+        u = load(UNCOVER)
+        u.setdefault(name, [])
+        for v in vals:
+            if v not in u[name]:
+                u[name].append(v)
+        save(u, UNCOVER)
+        print(f"{G}✓{X} mirrored into uncover")
+    print(f"{DIM}  validate: bb-keys test {name}{X}")
+
+
+def cmd_rm(name):
+    d = load()
+    if d.get(name):
+        d[name] = []
+        save(d)
+        print(f"{G}✓{X} cleared {name}")
+    else:
+        print(f"{DIM}{name} was already empty{X}")
+
+
+def cmd_test(only=None):
+    d = load()
+    todo = [k for k, v in d.items() if v and (not only or k == only)]
+    if not todo:
+        sys.exit("no keys configured to test — bb-keys links 1")
+    print(f"\n{B}validating {len(todo)} provider(s) against each vendor's API{X}\n")
+    ok = bad = unk = 0
+    for name in sorted(todo):
+        for i, key in enumerate(d[name]):
+            tag = f"{name}[{i+1}]" if len(d[name]) > 1 else name
+            sys.stdout.write(f"  {tag:<18} ")
+            sys.stdout.flush()
+            verdict, detail = probe(name, key)
+            if verdict == "ok":
+                print(f"{G}✓ VALID{X}   {DIM}{detail}{X}"); ok += 1
+            elif verdict == "bad":
+                print(f"{R}✗ REJECTED{X} {DIM}{detail}{X}"); bad += 1
+            elif verdict == "quota":
+                print(f"{Y}~ QUOTA{X}   {DIM}{detail}{X}"); ok += 1
+            else:
+                # fall back to subfinder for providers with no direct probe
+                try:
+                    r = subprocess.run(["subfinder", "-d", TESTDOM, "-s", name, "-silent",
+                                        "-timeout", "20"], capture_output=True, text=True,
+                                       timeout=60, env=dict(os.environ, BB=BB))
+                    hits = len([l for l in (r.stdout or "").splitlines() if l.strip()])
+                    if hits:
+                        print(f"{G}✓ VALID{X}   {DIM}subfinder: {hits} subdomains{X}"); ok += 1
+                    else:
+                        print(f"{Y}? UNVERIFIED{X} {DIM}{detail}{X}"); unk += 1
+                except Exception:
+                    print(f"{Y}? UNVERIFIED{X} {DIM}{detail}{X}"); unk += 1
+    print(f"\n  {G}{ok} valid{X}, {R}{bad} rejected{X}, {Y}{unk} unverified{X}\n")
+    if bad:
+        print(f"  {DIM}re-add a rejected key:  bb-keys rm <p> && bb-keys set <p> <NEWKEY>{X}\n")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    c = a[0]
+    if c == "list":
+        cmd_list()
+    elif c == "links":
+        cmd_links(a[1] if len(a) > 1 else "all")
+    elif c == "set":
+        if len(a) < 3:
+            sys.exit("usage: bb-keys set <provider> <key>")
+        cmd_set(a[1], " ".join(a[2:]).strip())
+    elif c == "rm":
+        cmd_rm(a[1])
+    elif c == "test":
+        cmd_test(a[1] if len(a) > 1 else None)
+    else:
+        sys.exit(f"unknown command '{c}' — see bb-keys --help")
+
+
+if __name__ == "__main__":
+    main()

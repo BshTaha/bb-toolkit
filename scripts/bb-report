@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""bb-report <program> [--min medium] [--all] [--summary] [--test]
+
+Pushes triaged findings to Discord as rich embeds. Never sends the same finding
+twice (state/sent.db). Severity gates what gets through so the channel stays
+signal-only.
+
+Webhook is read from, in order:
+  $DISCORD_WEBHOOK   |   $BB/data/configs/discord-webhook.txt
+"""
+import os, sys, json, time, argparse, urllib.request, urllib.error
+
+BB = os.environ.get("BB", os.path.expanduser("~/bugbounty"))
+TARGETS = os.environ.get("TARGETS", f"{BB}/targets")
+WEBHOOK_FILE = f"{BB}/data/configs/discord-webhook.txt"
+
+SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+COLOR = {"critical": 0xE01E5A, "high": 0xFF6B00, "medium": 0xFFC107,
+         "low": 0x3498DB, "info": 0x95A5A6}
+ICON = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}
+CONF = {"confirmed": "✅ confirmed", "likely": "⚠️ likely", "unverified": "❓ unverified"}
+
+
+def webhook():
+    w = os.environ.get("DISCORD_WEBHOOK", "").strip()
+    if not w and os.path.exists(WEBHOOK_FILE):
+        w = open(WEBHOOK_FILE).read().strip()
+    if not w.startswith("https://"):
+        sys.exit("!! no Discord webhook. Put it in $BB/data/configs/discord-webhook.txt "
+                 "or export DISCORD_WEBHOOK")
+    return w
+
+
+def post(url, payload, tries=5):
+    """POST one message, honouring Discord's 429 retry_after."""
+    body = json.dumps(payload).encode()
+    for attempt in range(tries):
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "bb-hunt/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                try:
+                    wait = json.loads(e.read()).get("retry_after", 2)
+                except Exception:
+                    wait = 2
+                time.sleep(float(wait) + 0.4)
+                continue
+            print(f"    [discord] HTTP {e.code}: {e.read()[:300]!r}", file=sys.stderr)
+            return e.code
+        except Exception as e:
+            print(f"    [discord] {e}", file=sys.stderr)
+            time.sleep(1.5 * (attempt + 1))
+    return 0
+
+
+def clip(s, n):
+    s = str(s or "").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def embed(f):
+    sev = f.get("severity", "info")
+    e = {
+        "title": clip(f"{ICON.get(sev,'⚪')} [{sev.upper()}] {f.get('title','(untitled)')}", 250),
+        "color": COLOR.get(sev, 0x95A5A6),
+        "description": clip(f"**Target** `{clip(f.get('target',''),300)}`", 500),
+        "fields": [],
+        "footer": {"text": clip(f"{f.get('program','?')} · {f.get('cls','misc')} · "
+                                f"{CONF.get(f.get('confidence','unverified'))} · "
+                                f"src:{f.get('source','?')}", 2040)},
+        "timestamp": f.get("ts"),
+    }
+    if f.get("evidence"):
+        e["fields"].append({"name": "Evidence",
+                            "value": f"```\n{clip(f['evidence'], 980)}\n```",
+                            "inline": False})
+    if f.get("repro"):
+        e["fields"].append({"name": "Repro",
+                            "value": f"```bash\n{clip(f['repro'], 980)}\n```",
+                            "inline": False})
+    return e
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("program")
+    ap.add_argument("--min", default="medium",
+                    help="minimum severity to push (default medium)")
+    ap.add_argument("--all", action="store_true", help="resend already-sent findings")
+    ap.add_argument("--summary", default="", help="post a plain cycle-summary line")
+    ap.add_argument("--test", action="store_true", help="send a connectivity test card")
+    ap.add_argument("--ping", default=os.environ.get("BB_PING", ""),
+                    help="text to prepend on critical/high, e.g. '@everyone' or '<@userid>'")
+    a = ap.parse_args()
+
+    url = webhook()
+
+    if a.test:
+        post(url, {"username": "bb-hunt",
+                   "embeds": [{"title": "✅ bb-hunt connected",
+                               "description": f"Reporting channel is live for **{a.program}**.",
+                               "color": 0x2ECC71}]})
+        print("[report] test card sent")
+        return 0
+
+    if a.summary:
+        post(url, {"username": "bb-hunt", "content": clip(a.summary, 1900)})
+        print("[report] summary sent")
+        return 0
+
+    d = f"{TARGETS}/{a.program}"
+    fp, sp = f"{d}/state/findings.jsonl", f"{d}/state/sent.db"
+    if not os.path.exists(fp):
+        print("[report] nothing to send yet")
+        return 0
+
+    sent = set()
+    if os.path.exists(sp) and not a.all:
+        sent = {l.strip() for l in open(sp) if l.strip()}
+
+    floor = SEV_RANK.get(a.min, 2)
+    queue = []
+    for line in open(fp, errors="ignore"):
+        try:
+            f = json.loads(line)
+        except Exception:
+            continue
+        if f["id"] in sent:
+            continue
+        if SEV_RANK.get(f.get("severity", "info"), 0) < floor:
+            continue
+        queue.append(f)
+
+    if not queue:
+        print("[report] no new findings above threshold")
+        return 0
+
+    queue.sort(key=lambda x: -SEV_RANK.get(x["severity"], 0))
+    hot = [f for f in queue if SEV_RANK.get(f["severity"], 0) >= 3]
+
+    ok = []
+    # Discord caps 10 embeds per message; batch in 5s to stay well inside limits.
+    for i in range(0, len(queue), 5):
+        batch = queue[i:i + 5]
+        payload = {"username": "bb-hunt", "embeds": [embed(f) for f in batch]}
+        if i == 0 and hot and a.ping:
+            payload["content"] = f"{a.ping} — {len(hot)} high/critical finding(s) on **{a.program}**"
+        code = post(url, payload)
+        if code and 200 <= code < 300:
+            ok += batch
+        time.sleep(0.7)
+
+    with open(sp, "a") as fh:
+        for f in ok:
+            fh.write(f["id"] + "\n")
+
+    print(f"[report] pushed {len(ok)}/{len(queue)} findings "
+          f"({len(hot)} high+) to Discord")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

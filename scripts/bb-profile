@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""bb-profile <program> [show|init|verify] — per-program request policy.
+
+Some programs mandate an identifying User-Agent (YesWeHack: ' -public-yeswehack ').
+Getting that wrong on even one tool is a policy violation, so this keeps the UA
+and rate limits in ONE place, emits ready-to-paste flags for every tool, and can
+PROVE the header actually goes out — against a throwaway local listener, so the
+proof costs the target zero requests.
+"""
+import os, sys, json, socket, subprocess, threading, http.server, shutil
+
+BB = os.environ.get("BB", os.path.expanduser("~/bugbounty"))
+TARGETS = os.environ.get("TARGETS", f"{BB}/targets")
+G, Y, R, B, DIM, X = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[1;36m", "\033[2m", "\033[0m"
+
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 "
+              "Firefox/128.0 -public-yeswehack ")
+
+
+def ppath(prog):
+    return f"{TARGETS}/{prog}/scope/profile.env"
+
+
+def load(prog):
+    p, d = ppath(prog), {}
+    if not os.path.exists(p):
+        return d
+    for line in open(p):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        d[k.strip()] = v.strip().strip('"')
+    return d
+
+
+def init(prog, ua=DEFAULT_UA, rate="5", threads="3", marker="-public-yeswehack"):
+    d = f"{TARGETS}/{prog}/scope"
+    os.makedirs(d, exist_ok=True)
+    with open(ppath(prog), "w") as f:
+        f.write(f'''# Request policy for {prog} — sourced by bb-* scripts.
+# Program mandates this User-Agent. Do NOT run any tool without it.
+BB_UA="{ua}"
+BB_UA_MARKER="{marker}"
+BB_RATE={rate}
+BB_THREADS={threads}
+''')
+    # curl config so `curl -K <file>` is always compliant
+    with open(f"{d}/curlrc", "w") as f:
+        f.write(f'user-agent = "{ua}"\n')
+    print(f"{G}✓{X} wrote {ppath(prog)}")
+    print(f"{G}✓{X} wrote {d}/curlrc  {DIM}(use: curl -K {d}/curlrc ...){X}")
+    show(prog)
+
+
+def flags(prog):
+    p = load(prog)
+    ua, rate, th = p.get("BB_UA", ""), p.get("BB_RATE", "5"), p.get("BB_THREADS", "3")
+    return {
+        "curl":   f"curl -A '{ua}'",
+        "httpx":  f"httpx -H 'User-Agent: {ua}' -rl {rate} -threads {th}",
+        "katana": f"katana -H 'User-Agent: {ua}' -rl {rate} -c {th}",
+        "nuclei": f"nuclei -H 'User-Agent: {ua}' -rl {rate} -c {th}",
+        "ffuf":   f"ffuf -H 'User-Agent: {ua}' -rate {rate} -t {th}",
+        "dalfox": f"dalfox --user-agent '{ua}' --delay 300",
+    }
+
+
+def show(prog):
+    p = load(prog)
+    if not p:
+        sys.exit(f"no profile for {prog} — run: bb-profile {prog} init")
+    print(f"\n{B}request policy — {prog}{X}")
+    print(f"  User-Agent : {p.get('BB_UA')}")
+    print(f"  marker     : {p.get('BB_UA_MARKER')}")
+    print(f"  rate       : {p.get('BB_RATE')} req/s     threads: {p.get('BB_THREADS')}")
+    print(f"\n{B}compliant invocations{X}")
+    for k, v in flags(prog).items():
+        print(f"  {DIM}{k:<7}{X} {v}")
+    print()
+
+
+
+def _probe_tpl():
+    """A throwaway nuclei template that fires on any 200 — so the UA check
+    actually exercises nuclei's HTTP path instead of silently sending nothing."""
+    d = os.environ.get("TMPDIR", "/tmp")
+    p = os.path.join(d, "bb-ua-probe.yaml")
+    with open(p, "w") as f:
+        f.write("""id: bb-ua-probe
+info:
+  name: bb user-agent probe
+  author: bb
+  severity: info
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+    matchers:
+      - type: status
+        status:
+          - 200
+""")
+    return p
+
+
+class Echo(http.server.BaseHTTPRequestHandler):
+    seen = []
+
+    def do_GET(self):
+        Echo.seen.append(self.headers.get("User-Agent", ""))
+        body = b'<html><body><a href="/x">x</a>ok</body></html>'
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_POST = do_GET
+
+    def log_message(self, *a):
+        pass
+
+
+def verify(prog):
+    p = load(prog)
+    if not p:
+        sys.exit(f"no profile for {prog} — run: bb-profile {prog} init")
+    marker = p.get("BB_UA_MARKER", "").strip()
+    if not marker:
+        sys.exit("profile has no BB_UA_MARKER")
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Echo)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{port}/"
+    print(f"\n{B}verifying User-Agent reaches the wire{X} {DIM}(local listener :{port}, "
+          f"0 requests to the target){X}\n")
+
+    f = flags(prog)
+    tests = [
+        ("curl",   f"{f['curl']} -s -o /dev/null {url}"),
+        ("httpx",  f"{f['httpx']} -u {url} -silent -no-color"),
+        ("katana", f"{f['katana']} -u {url} -d 1 -silent -no-color"),
+        ("nuclei", f"{f['nuclei']} -u {url} -t {_probe_tpl()} -silent -no-color -duc"),
+        ("ffuf",   f"{f['ffuf']} -u {url}FUZZ -w /dev/stdin -s -mc all"),
+    ]
+    ok = bad = 0
+    for name, cmd in tests:
+        if not shutil.which(name):
+            print(f"  {name:<8} {DIM}not installed, skipped{X}")
+            continue
+        before = len(Echo.seen)
+        try:
+            subprocess.run(cmd, shell=True, capture_output=True, timeout=60,
+                           input=b"a\n", env=dict(os.environ, BB=BB))
+        except subprocess.TimeoutExpired:
+            pass
+        got = Echo.seen[before:]
+        if not got:
+            print(f"  {name:<8} {Y}? no request observed{X}")
+            continue
+        if all(marker in u for u in got):
+            print(f"  {name:<8} {G}✓ marker present{X} {DIM}({len(got)} req){X}")
+            ok += 1
+        else:
+            miss = [u for u in got if marker not in u][:1]
+            print(f"  {name:<8} {R}✗ MARKER MISSING{X} {DIM}sent: {miss}{X}")
+            bad += 1
+    srv.shutdown()
+    print(f"\n  {G}{ok} compliant{X}, {R}{bad} non-compliant{X}")
+    if bad:
+        print(f"  {R}Do not run the failing tool against the target until fixed.{X}\n")
+    else:
+        print(f"  {DIM}All checked tools emit the required marker.{X}\n")
+    return 1 if bad else 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 0
+    prog = sys.argv[1]
+    cmd = sys.argv[2] if len(sys.argv) > 2 else "show"
+    if cmd == "init":
+        init(prog)
+    elif cmd == "show":
+        show(prog)
+    elif cmd == "verify":
+        return verify(prog)
+    else:
+        sys.exit(f"unknown: {cmd}  (init|show|verify)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

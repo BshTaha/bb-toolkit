@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# bb-recon <program>  — subdomain enum -> resolve -> live hosts -> tech/ports
+# Reads  targets/<program>/scope/roots.txt
+set -uo pipefail
+[ $# -lt 1 ] && { echo "usage: bb-recon <program>"; exit 1; }
+P="$1"; D="${TARGETS}/$P"; R="$D/recon"
+[ -s "$D/scope/roots.txt" ] || { echo "!! put root domains in $D/scope/roots.txt"; exit 1; }
+mkdir -p "$R"; cd "$R"
+TS=$(date +%F_%H%M)
+
+echo "[1/5] passive subdomain enum (subfinder)"
+subfinder -dL "$D/scope/roots.txt" -all -silent -o subs_subfinder.txt
+
+echo "[2/5] merging + resolving (dnsx)"
+cat subs_*.txt 2>/dev/null | anew subdomains.txt >/dev/null
+wc -l < subdomains.txt | xargs echo "    total unique subdomains:"
+dnsx -l subdomains.txt -r "$RESOLVERS" -silent -a -resp -o resolved.txt 2>/dev/null
+cut -d' ' -f1 resolved.txt 2>/dev/null | sort -u > resolved_hosts.txt
+
+echo "[3/5] probing live hosts (httpx)"
+httpx -l resolved_hosts.txt -silent -sc -title -tech-detect -cl -location \
+      -threads 50 -rl 150 -timeout 8 -retries 1 -o live_full.txt
+grep -oE '^https?://[^ ]+' live_full.txt | sort -u > live.txt
+wc -l < live.txt | xargs echo "    live hosts:"
+
+echo "[4/5] new-since-last-run diff"
+cp -n subdomains.txt .baseline_subs.txt 2>/dev/null
+comm -13 <(sort .baseline_subs.txt) <(sort subdomains.txt) > new_${TS}.txt
+[ -s new_${TS}.txt ] && echo "    !! NEW: $(wc -l < new_${TS}.txt)" || rm -f new_${TS}.txt
+cp subdomains.txt .baseline_subs.txt
+
+echo "[5/5] port scan on resolved (naabu, top ports)"
+naabu -l resolved_hosts.txt -top-ports 1000 -silent -rate 1000 -o ports.txt 2>/dev/null
+
+echo "[done] $R  — live.txt / live_full.txt / ports.txt"

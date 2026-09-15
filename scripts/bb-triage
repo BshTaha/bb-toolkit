@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""bb-triage <program> — normalize every raw scanner output into scored, deduped findings.
+
+Reads whatever exists under targets/<program>/{scans,loot,urls,recon}
+Writes  targets/<program>/state/findings.jsonl   (append-only, deduped by id)
+Prints  a severity tally.
+
+The point of this script is to answer "what deserves your attention" — it
+aggressively drops known-noise templates and boosts classes that are almost
+always a real bug.
+"""
+import os, sys, re, json, hashlib, glob, time
+from datetime import datetime, timezone
+
+BB = os.environ.get("BB", os.path.expanduser("~/bugbounty"))
+TARGETS = os.environ.get("TARGETS", f"{BB}/targets")
+
+# --- nuclei template ids that are pure noise in a bounty context -------------
+NOISE = {
+    "tech-detect","waf-detect","ssl-issuer","ssl-dns-names","tls-version",
+    "weak-cipher-suites","deprecated-tls","self-signed-ssl","expired-ssl",
+    "mismatched-ssl-certificate","untrusted-root-certificate","revoked-ssl-certificate",
+    "http-missing-security-headers","options-method","x-frame-options-header",
+    "cookies-without-secure","cookies-without-httponly","xss-deprecated-header",
+    "content-security-policy","strict-transport-security","x-content-type-options",
+    "robots-txt-endpoint","favicon-detect","metatag-cms","waf-fingerprint",
+    "dns-saas-service-detection","caa-fingerprint","txt-fingerprint","mx-fingerprint",
+    "ptr-fingerprint","nameserver-fingerprint","http-trace","form-detection",
+    "email-extractor","credit-card-disclosure","openapi","swagger-api",
+    "wordpress-detect","apache-detect","nginx-version","php-detect","iis-version",
+    # Explicitly non-qualifying on essentially every program's policy.
+    # Filing any of these burns a report for nothing.
+    "spf-record","dmarc-detect","dkim-record","missing-spf","spf-none",
+    "clickjacking","x-frame-options","frame-ancestors",
+    "dns-zone-transfer-detect","dangling-cname-detect","caa-missing",
+    "known-vulnerable-library","outdated-library","jquery-version",
+    "exposed-service-detect","open-port-detect","banner-grab",
+    "http-method-override","trace-method","dns-rebinding",
+}
+NOISE_RE = re.compile(r"(detect|fingerprint|-version$|^tech-|^ssl-|^tls-|panel$|login$|"
+                      r"default-page|version-disclosure|generic-tokens)", re.I)
+
+# --- classes that are worth waking up for, regardless of template severity ---
+BOOST = [
+    (re.compile(r"(takeover|subdomain-takeover)", re.I),              "critical", "subdomain-takeover"),
+    (re.compile(r"(\.git/config|git-config|git-directory|exposed-git)", re.I), "critical", "exposed-source"),
+    (re.compile(r"(\.env|env-file|dotenv|environment-file)", re.I),   "critical", "exposed-secrets"),
+    (re.compile(r"(rce|remote-code|command-inject|deserializ|log4j|spring4shell|shellshock)", re.I),
+                                                                      "critical", "rce"),
+    (re.compile(r"(sqli|sql-injection|error-based-sql)", re.I),       "critical", "sqli"),
+    (re.compile(r"(ssrf|server-side-request)", re.I),                 "high",     "ssrf"),
+    (re.compile(r"(lfi|local-file-in|path-traversal|directory-traversal|file-read)", re.I),
+                                                                      "high",     "lfi"),
+    (re.compile(r"(ssti|template-injection)", re.I),                  "high",     "ssti"),
+    (re.compile(r"(xxe|xml-external)", re.I),                         "high",     "xxe"),
+    (re.compile(r"(auth-bypass|authentication-bypass|unauth)", re.I), "high",     "authz"),
+    (re.compile(r"(backup|\.bak|db-dump|sql-dump|database-file)", re.I),"high",   "exposed-backup"),
+    (re.compile(r"(aws|s3)-(bucket|creds|key)", re.I),                "high",     "cloud"),
+    (re.compile(r"(idor|insecure-direct)", re.I),                     "high",     "idor"),
+    (re.compile(r"(open-redirect|openredirect)", re.I),               "medium",   "open-redirect"),
+    (re.compile(r"(xss|cross-site-script)", re.I),                    "medium",   "xss"),
+    (re.compile(r"(cors|crossdomain)", re.I),                         "medium",   "cors"),
+    (re.compile(r"(crlf|response-split|host-header)", re.I),          "medium",   "crlf"),
+]
+
+SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def fid(*parts):
+    return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:16]
+
+
+def classify(name, default_sev):
+    """Return (severity, class) after applying boost rules."""
+    for rx, sev, cls in BOOST:
+        if rx.search(name):
+            # keep the higher of the two severities
+            if SEV_RANK[sev] >= SEV_RANK.get(default_sev, 0):
+                return sev, cls
+            return default_sev, cls
+    return default_sev, "misc"
+
+
+def is_noise(tid, name, sev):
+    if tid in NOISE:
+        return True
+    # never drop something a boost rule claimed
+    for rx, _s, _c in BOOST:
+        if rx.search(tid) or rx.search(name):
+            return False
+    if sev in ("info", "unknown") and NOISE_RE.search(tid):
+        return True
+    return sev in ("info", "unknown")
+
+
+# ---------------------------------------------------------------- collectors
+def from_nuclei(d, prog, out):
+    for path in glob.glob(f"{d}/scans/nuclei*.jsonl"):
+        for line in open(path, errors="ignore"):
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tid = r.get("template-id", "")
+            info = r.get("info", {}) or {}
+            name = info.get("name", tid)
+            sev = (info.get("severity") or "info").lower()
+            if is_noise(tid, f"{tid} {name}", sev):
+                continue
+            sev, cls = classify(f"{tid} {name}", sev)
+            tgt = r.get("matched-at") or r.get("host", "")
+            ev = (r.get("extracted-results") or [""])[0] if r.get("extracted-results") else ""
+            ev = (ev or r.get("matcher-name", "") or name)[:400]
+            curl = r.get("curl-command", "")
+            out.append(dict(
+                id=fid("nuclei", tid, tgt), ts=now(), program=prog, severity=sev,
+                cls=cls, title=name, target=tgt, evidence=ev,
+                repro=(curl or f"nuclei -id {tid} -u {tgt}")[:900],
+                source=f"nuclei:{tid}",
+                confidence="likely" if sev in ("critical", "high") else "unverified",
+                tags=info.get("tags", "")))
+
+
+def from_verify(d, prog, out):
+    """bb-verify already emits the finding schema — these are CONFIRMED."""
+    p = f"{d}/state/verified.jsonl"
+    if not os.path.exists(p):
+        return
+    for line in open(p, errors="ignore"):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        r.setdefault("program", prog)
+        r.setdefault("ts", now())
+        out.append(r)
+
+
+def from_takeover(d, prog, out):
+    p = f"{d}/scans/takeover_subzy.txt"
+    if not os.path.exists(p):
+        return
+    for line in open(p, errors="ignore"):
+        if "[ VULNERABLE ]" not in line.upper() and "VULNERABLE" not in line.upper():
+            continue
+        host = ""
+        m = re.search(r"https?://([^\s\]]+)|\b([a-z0-9._-]+\.[a-z]{2,})\b", line, re.I)
+        if m:
+            host = m.group(1) or m.group(2)
+        if not host:
+            continue
+        out.append(dict(
+            id=fid("subzy", host), ts=now(), program=prog, severity="critical",
+            cls="subdomain-takeover", title=f"Possible subdomain takeover: {host}",
+            target=host, evidence=line.strip()[:400],
+            repro=f"dig CNAME {host} +short ; curl -sI https://{host}",
+            source="subzy", confidence="likely", tags="takeover"))
+
+
+SECRET_PATTERNS = [
+    (re.compile(r"AKIA[0-9A-Z]{16}"),                      "critical", "AWS access key id"),
+    (re.compile(r"ghp_[0-9A-Za-z]{36}"),                   "critical", "GitHub personal token"),
+    (re.compile(r"github_pat_[0-9A-Za-z_]{60,}"),          "critical", "GitHub fine-grained PAT"),
+    (re.compile(r"sk_live_[0-9A-Za-z]{24,}"),              "critical", "Stripe live secret key"),
+    (re.compile(r"xox[bapr]-[0-9A-Za-z-]{10,}"),           "critical", "Slack token"),
+    (re.compile(r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"), "critical", "Private key"),
+    (re.compile(r"AIza[0-9A-Za-z_-]{35}"),                 "medium",   "Google API key"),
+    (re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\."), "low", "JWT"),
+]
+
+
+def from_secrets(d, prog, out):
+    p = f"{d}/loot/js_secrets.txt"
+    if not os.path.exists(p):
+        return
+    for line in open(p, errors="ignore"):
+        line = line.strip()
+        if not line:
+            continue
+        for rx, sev, label in SECRET_PATTERNS:
+            m = rx.search(line)
+            if not m:
+                continue
+            tok = m.group(0)
+            out.append(dict(
+                id=fid("secret", tok), ts=now(), program=prog, severity=sev,
+                cls="exposed-secrets", title=f"{label} in client-side JS",
+                target=prog, evidence=(tok[:12] + "…" + tok[-4:]) if len(tok) > 20 else tok,
+                repro=f"grep -rn '{tok[:12]}' {d}/urls/jsfiles/",
+                source="js-secrets", confidence="likely", tags="secret,js"))
+            break
+
+
+def from_newassets(d, prog, out):
+    """New subdomains appearing mid-hunt are a lead, not a bug — low sev, but the operator wants them."""
+    for path in sorted(glob.glob(f"{d}/recon/new_*.txt")):
+        hosts = [h.strip() for h in open(path, errors="ignore") if h.strip()]
+        if not hosts:
+            continue
+        stamp = os.path.basename(path)[4:-4]
+        out.append(dict(
+            id=fid("newassets", stamp, len(hosts)), ts=now(), program=prog,
+            severity="low", cls="new-asset",
+            title=f"{len(hosts)} new subdomain(s) appeared",
+            target=prog, evidence=", ".join(hosts[:15])[:400],
+            repro=f"cat {path}", source="recon-diff",
+            confidence="confirmed", tags="recon"))
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit("usage: bb-triage <program>")
+    prog = sys.argv[1]
+    d = f"{TARGETS}/{prog}"
+    if not os.path.isdir(d):
+        sys.exit(f"!! no workspace {d}")
+    st = f"{d}/state"
+    os.makedirs(st, exist_ok=True)
+    findings_path = f"{st}/findings.jsonl"
+
+    seen = set()
+    if os.path.exists(findings_path):
+        for line in open(findings_path, errors="ignore"):
+            try:
+                seen.add(json.loads(line)["id"])
+            except Exception:
+                pass
+
+    out = []
+    for fn in (from_verify, from_nuclei, from_takeover, from_secrets, from_newassets):
+        try:
+            fn(d, prog, out)
+        except Exception as e:
+            print(f"    [warn] {fn.__name__}: {e}", file=sys.stderr)
+
+    fresh, tally = [], {}
+    with open(findings_path, "a") as fh:
+        for f in out:
+            if f["id"] in seen:
+                continue
+            seen.add(f["id"])
+            fh.write(json.dumps(f) + "\n")
+            fresh.append(f)
+            tally[f["severity"]] = tally.get(f["severity"], 0) + 1
+
+    fresh.sort(key=lambda x: -SEV_RANK.get(x["severity"], 0))
+    for s in ("critical", "high", "medium", "low"):
+        if tally.get(s):
+            print(f"    {s:<9} {tally[s]}")
+    print(f"[triage] {len(fresh)} new / {len(seen)} total -> {findings_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

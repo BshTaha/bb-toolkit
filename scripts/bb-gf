@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# bb-gf <program> — run every gf pattern over the collected URLs
+set -uo pipefail
+P="${1:?usage: bb-gf <program>}"; D="$TARGETS/$P"
+[ -s "$D/urls/urls.txt" ] || { echo "!! run bb-urls first"; exit 1; }
+O="$D/urls/gf"; mkdir -p "$O"
+for p in $(gf -list 2>/dev/null); do
+  n=$(gf "$p" "$D/urls/urls.txt" 2>/dev/null | sort -u | tee "$O/$p.txt" | wc -l)
+  [ "$n" -gt 0 ] && printf "  %-22s %s\n" "$p" "$n" || rm -f "$O/$p.txt"
+done
+echo "[done] $O"

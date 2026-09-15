@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# bb-new <program> [domain ...]  — scaffold a new bug bounty program workspace
+set -euo pipefail
+[ $# -lt 1 ] && { echo "usage: bb-new <program-name> [root-domain ...]"; exit 1; }
+P="$1"; shift
+D="${TARGETS:-$HOME/bugbounty/targets}/$P"
+mkdir -p "$D"/{scope,recon,urls,scans,screenshots,loot,notes}
+[ $# -gt 0 ] && printf '%s\n' "$@" > "$D/scope/roots.txt"
+touch "$D/scope/out-of-scope.txt"
+cat > "$D/notes/README.md" <<NOTE
+# $P
+
+- **Platform:**
+- **Scope URL:**
+- **Started:** $(date +%F)
+
+## In scope
+$(cat "$D/scope/roots.txt" 2>/dev/null | sed 's/^/- /')
+
+## Out of scope
+(fill from the program page — read the policy BEFORE scanning)
+
+## Rules / rate limits
+
+## Findings
+| # | Title | Severity | Status |
+|---|-------|----------|--------|
+
+## Log
+- $(date +%F): workspace created
+NOTE
+echo "[+] $D"
+ls "$D"

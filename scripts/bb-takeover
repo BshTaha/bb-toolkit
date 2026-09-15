@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# bb-takeover <program> — subdomain takeover checks (subzy + nuclei takeover templates)
+set -uo pipefail
+P="${1:?usage: bb-takeover <program>}"; D="$TARGETS/$P"
+[ -s "$D/recon/subdomains.txt" ] || { echo "!! run bb-recon first"; exit 1; }
+mkdir -p "$D/scans"
+echo "[1/2] subzy"
+subzy run --targets "$D/recon/subdomains.txt" --concurrency 30 --hide_fails 2>&1 | tee "$D/scans/takeover_subzy.txt"
+echo "[2/2] nuclei takeover templates"
+nuclei -l "$D/recon/subdomains.txt" -t "$NUCLEI_TEMPLATES/http/takeovers/" -rl 100 -silent -o "$D/scans/takeover_nuclei.txt"
+echo "[done] $D/scans/"

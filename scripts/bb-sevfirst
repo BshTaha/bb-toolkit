@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# bb-sevfirst <program> <host-list> [severity] — rate-capped, severity-first sweep.
+#
+# For programs with a hard per-host request cap where blasting all 13,619
+# templates is the wrong use of the budget. Resolves via DNS (free — does not
+# touch the target's HTTP surface), probes, then runs only high+critical
+# templates. Sources the program's bb-profile for UA and rate.
+set -uo pipefail
+P="${1:?usage: bb-sevfirst <program> <host-list> [severity]}"
+L="${2:?need a host list}"
+SEV="${3:-high,critical}"
+: "${BB:=$HOME/bugbounty}"; : "${TARGETS:=$BB/targets}"
+: "${NUCLEI_TEMPLATES:=$BB/data/templates/nuclei-templates}"
+: "${RESOLVERS:=$BB/data/resolvers/resolvers.txt}"
+D="$TARGETS/$P"; TS=$(date +%F_%H%M)
+mkdir -p "$D"/{recon,scans,state}
+
+UA_ARGS=()
+if [ -s "$D/scope/profile.env" ]; then
+  . "$D/scope/profile.env"
+  [ -n "${BB_UA:-}" ] && UA_ARGS=(-H "User-Agent: $BB_UA")
+fi
+RATE="${BB_RATE:-5}"; THREADS="${BB_THREADS:-5}"
+say(){ printf '\n\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+say "input: $(wc -l < "$L") hosts   rate=${RATE}/s threads=${THREADS} severity=${SEV}"
+
+say "1/4 DNS resolve (queries public resolvers, not the target's HTTP surface)"
+dnsx -l "$L" -r "$RESOLVERS" -silent -a -t 100 -o "$D/recon/resolved_sev.txt" 2>/dev/null
+cut -d' ' -f1 "$D/recon/resolved_sev.txt" 2>/dev/null | sort -u > "$D/recon/resolved_hosts_sev.txt"
+echo "    resolved: $(wc -l < "$D/recon/resolved_hosts_sev.txt")"
+
+say "2/4 HTTP probe @ ${RATE} req/s  (~$(( $(wc -l < "$D/recon/resolved_hosts_sev.txt") / RATE / 60 )) min)"
+httpx "${UA_ARGS[@]}" -l "$D/recon/resolved_hosts_sev.txt" -silent -sc -title -tech-detect -cl \
+  -threads "$THREADS" -rl "$RATE" -timeout 10 -retries 1 \
+  -o "$D/recon/live_full_sev.txt" 2>/dev/null
+grep -oE '^https?://[^ ]+' "$D/recon/live_full_sev.txt" 2>/dev/null | sort -u > "$D/recon/live_sev.txt"
+# re-apply scope exclusions
+if [ -s "$D/scope/out-of-scope.txt" ]; then
+  grep -vEf <(grep -vE '^\s*(#|$)' "$D/scope/out-of-scope.txt") "$D/recon/live_sev.txt" > "$D/recon/live_sev.tmp" \
+    && mv "$D/recon/live_sev.tmp" "$D/recon/live_sev.txt"
+fi
+echo "    live: $(wc -l < "$D/recon/live_sev.txt")"
+
+say "3/4 nuclei -severity ${SEV} @ ${RATE} req/s"
+nuclei "${UA_ARGS[@]}" -l "$D/recon/live_sev.txt" -t "$NUCLEI_TEMPLATES" \
+  -severity "$SEV" -rl "$RATE" -c "$THREADS" -timeout 10 -retries 1 -stats -si 180 \
+  -eid ssl-issuer,tech-detect,waf-detect,http-missing-security-headers \
+  -jsonl -o "$D/scans/nuclei_sevfirst_${TS}.jsonl" 2>&1 | tail -5
+
+say "4/4 triage + report"
+bb-triage "$P" 2>&1 | sed 's/^/    /'
+bb-report "$P" --min medium 2>&1 | sed 's/^/    /'
+say "done — $D/scans/nuclei_sevfirst_${TS}.jsonl"

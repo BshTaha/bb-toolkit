@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# bb-brute <program> [--depth fast|deep|max] [--perms] [--rate N]
+#
+# Keyless subdomain discovery — no API, no quota, no expiry. Finds hosts that
+# passive sources structurally CANNOT know about: anything never issued a
+# certificate, never crawled, never leaked.
+#
+#   1. DNS bruteforce   (puredns/massdns, wildcard-filtered)
+#   2. Permutations     (alterx over already-known subs, then resolve)
+#
+# Results are anew'd into recon/subdomains.txt so bb-hunt picks them up.
+set -uo pipefail
+P="${1:?usage: bb-brute <program> [--depth fast|deep|max] [--perms]}"; shift || true
+
+DEPTH=fast; PERMS=0; RATE=5000; PERMLIMIT=500000; ROOTSFILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --depth) DEPTH="$2"; shift;; --perms) PERMS=1;;
+    --rate) RATE="$2"; shift;; --perm-limit) PERMLIMIT="$2"; shift;;
+    --roots) ROOTSFILE="$2"; shift;;
+    *) echo "unknown: $1"; exit 1;;
+  esac; shift
+done
+
+: "${BB:=$HOME/bugbounty}"; : "${TARGETS:=$BB/targets}"
+: "${RESOLVERS:=$BB/data/resolvers/resolvers.txt}"
+SL="$BB/wordlists/seclists/Discovery/DNS"
+D="$TARGETS/$P"
+ROOTS="${ROOTSFILE:-$D/scope/roots.txt}"
+[ -s "$ROOTS" ] || { echo "!! no roots in $ROOTS"; exit 1; }
+mkdir -p "$D/recon"
+
+case "$DEPTH" in
+  fast) WL="$SL/subdomains-top1million-110000.txt";;
+  deep) WL="$SL/combined_subdomains.txt";;
+  max)  WL="$SL/bug-bounty-program-subdomains-trickest-inventory.txt";;
+  *) echo "!! --depth must be fast|deep|max"; exit 1;;
+esac
+[ -s "$WL" ] || { echo "!! wordlist missing: $WL"; exit 1; }
+command -v massdns >/dev/null 2>&1 || { echo "!! massdns not on PATH — puredns needs it"; exit 1; }
+
+touch "$D/recon/subdomains.txt"
+BEFORE=$(wc -l < "$D/recon/subdomains.txt")
+echo "[brute] depth=$DEPTH  wordlist=$(basename "$WL") ($(wc -l < "$WL") words)  rate=$RATE"
+
+# ---------------------------------------------------------- 1. bruteforce
+while read -r root; do
+  [ -z "$root" ] && continue
+  echo "  → bruteforcing $root"
+  puredns bruteforce "$WL" "$root" \
+    -r "$RESOLVERS" --rate-limit "$RATE" --wildcard-tests 30 --wildcard-batch 1000000 \
+    --quiet 2>/dev/null | anew "$D/recon/subdomains.txt" >/dev/null
+done < "$ROOTS"
+
+# ------------------------------------------------- 2. permutations (alterx)
+if [ "$PERMS" = 1 ] && [ -s "$D/recon/subdomains.txt" ]; then
+  echo "  → generating permutations from $(wc -l < "$D/recon/subdomains.txt") known hosts"
+  # -limit bounds the combinatorial blowup on big scopes; timeout guards against
+  # alterx stalling on first-run config init and hanging the whole night's loop.
+  timeout 300 alterx -l "$D/recon/subdomains.txt" -limit "$PERMLIMIT" -silent 2>/dev/null \
+    | sort -u > "$D/recon/.perms.txt" || echo "    [warn] alterx timed out — skipping permutations"
+  echo "    $(wc -l < "$D/recon/.perms.txt") candidates — resolving"
+  puredns resolve "$D/recon/.perms.txt" \
+    -r "$RESOLVERS" --rate-limit "$RATE" --wildcard-tests 30 --wildcard-batch 1000000 \
+    --quiet 2>/dev/null | anew "$D/recon/subdomains.txt" >/dev/null
+  rm -f "$D/recon/.perms.txt"
+fi
+
+AFTER=$(wc -l < "$D/recon/subdomains.txt")
+echo "[brute] $BEFORE -> $AFTER subdomains (+$((AFTER-BEFORE)) keyless)"

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# bb-update  — update every tool, template and wordlist in the environment
+set -uo pipefail
+echo "== nuclei templates =="
+cd "$BB/data/templates" && curl -sSL --retry 15 --retry-all-errors --retry-delay 3 -C - -o nt.tar.gz \
+  "https://codeload.github.com/projectdiscovery/nuclei-templates/tar.gz/refs/heads/main" \
+  && rm -rf nuclei-templates && tar -xzf nt.tar.gz && mv nuclei-templates-main nuclei-templates && rm -f nt.tar.gz \
+  && echo "  templates: $(find nuclei-templates -name '*.yaml' | wc -l)"
+echo "== go tools =="
+while read -r pkg; do
+  [ -z "$pkg" ] && continue
+  n=$(basename "${pkg%@*}")
+  printf "  %-16s " "$n"
+  GOFLAGS=-mod=mod go install "$pkg" 2>&1 | tail -1 && echo "ok"
+done < "$BB/data/configs/go-tools.txt"
+echo "== python tools =="; pipx upgrade-all 2>&1 | tail -5
+echo "== wordlists =="
+for r in "$BB"/wordlists/*/ "$BB"/tools/*/; do
+  [ -d "$r/.git" ] && { printf "  %-24s " "$(basename $r)"; git -C "$r" pull -q 2>&1 | tail -1; echo "ok"; }
+done
+echo "== resolvers =="
+curl -sSL -o "$RESOLVERS" https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt && wc -l < "$RESOLVERS"

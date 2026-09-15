@@ -1,0 +1,33 @@
+# --- engagement data: NEVER commit -------------------------------------------
+# Program workspaces hold live recon output, session data and findings on real
+# companies you are under disclosure terms with.
+targets/
+loot/
+logs/
+*.flows
+cookies.txt
+
+# --- secrets -----------------------------------------------------------------
+data/configs/discord-webhook.txt
+data/configs/tools/
+data/configs/pdcp/
+*.env
+!scripts/env-mobile.sh
+.env.*
+*provider-config.yaml
+*.key
+*.pem
+
+# --- installed artifacts (install.sh rebuilds these) --------------------------
+bin/
+opt/
+tools/
+wordlists/
+data/templates/
+data/resolvers/
+data/configs/gf/
+
+# --- misc --------------------------------------------------------------------
+__pycache__/
+*.pyc
+.DS_Store

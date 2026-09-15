@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: lint bash
+        run: |
+          set -e
+          files=$(grep -rlE '^#!/usr/bin/env bash' scripts install.sh env.sh)
+          echo "linting: $files"
+          # SC1090/SC1091: sourced paths are runtime-resolved
+          # SC2086: word splitting is intentional in the tool-flag paths
+          shellcheck -e SC1090,SC1091,SC2086 -S warning $files
+
+  python:
+    name: python syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: compile
+        run: |
+          set -e
+          for f in $(grep -rlE '^#!/usr/bin/env python3' scripts); do
+            echo "  $f"; python3 -m py_compile "$f"
+          done
+
+  smoke:
+    name: smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash syntax
+        run: |
+          set -e
+          for f in $(grep -rlE '^#!/usr/bin/env bash' scripts install.sh env.sh); do
+            bash -n "$f" && echo "  ok $f"
+          done
+      - name: env.sh sources cleanly and exports BB
+        run: |
+          set -e
+          chmod +x scripts/* env.sh
+          source ./env.sh
+          test -n "$BB" || { echo "BB not exported"; exit 1; }
+          test "$BB" = "$GITHUB_WORKSPACE" || { echo "BB=$BB, expected $GITHUB_WORKSPACE"; exit 1; }
+          echo "  BB=$BB"
+      - name: bb-new scaffolds a workspace
+        run: |
+          set -e
+          source ./env.sh
+          bb-new acme acme.com api.acme.com
+          for d in scope recon urls scans notes; do
+            test -d "$TARGETS/acme/$d" || { echo "missing $d"; exit 1; }
+          done
+          grep -q acme.com "$TARGETS/acme/scope/roots.txt"
+          echo "  workspace ok"
+      - name: scripts refuse to run without scope
+        run: |
+          set -e
+          source ./env.sh
+          bb-new empty
+          if bb-hunt empty --no-discord 2>/dev/null; then
+            echo "bb-hunt should have refused an empty scope"; exit 1
+          fi
+          echo "  refused as expected"
+      - name: --help / usage exits cleanly
+        run: |
+          set -e
+          source ./env.sh
+          ./install.sh --help >/dev/null && echo "  install.sh --help ok"
+          bb-new 2>&1 | grep -q usage && echo "  bb-new usage ok"
