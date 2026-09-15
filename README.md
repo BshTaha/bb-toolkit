@@ -187,6 +187,10 @@ real traffic against real systems. Before running anything here:
 Running an unattended scanner against a target that forbids it gets your account
 banned and can be unlawful. That is your responsibility, not the toolkit's.
 
+## Contributing
+
+Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
