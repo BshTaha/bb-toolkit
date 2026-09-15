@@ -3,10 +3,11 @@
 set -uo pipefail
 [ $# -lt 1 ] && { echo "usage: bb-urls <program>"; exit 1; }
 P="$1"; D="${TARGETS}/$P"; U="$D/urls"
-mkdir -p "$U"; cd "$U"
+mkdir -p "$U"; cd "$U" || { echo "!! cannot cd $U"; exit 1; }
 
 echo "[1/4] historical URLs (gau)"
-gau --threads 8 --subs $(tr '\n' ' ' < "$D/scope/roots.txt") 2>/dev/null | anew raw.txt >/dev/null
+mapfile -t ROOTS < <(grep -vE '^\s*(#|$)' "$D/scope/roots.txt")
+gau --threads 8 --subs "${ROOTS[@]}" 2>/dev/null | anew raw.txt >/dev/null
 
 echo "[2/4] active crawl (katana)"
 [ -s "$D/recon/live.txt" ] && katana -list "$D/recon/live.txt" -d 3 -jc -kf all -silent -rl 100 -c 15 2>/dev/null | anew raw.txt >/dev/null

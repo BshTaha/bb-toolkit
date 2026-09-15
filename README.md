@@ -1,5 +1,8 @@
 # bb-toolkit
 
+[![ci](https://github.com/BshTaha/bb-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/BshTaha/bb-toolkit/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A self-contained, policy-aware recon and hunting pipeline for bug bounty. It runs
 unattended all night, **proves** what it finds before alerting you, and pushes only
 verified findings to Discord.

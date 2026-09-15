@@ -5,7 +5,7 @@ set -uo pipefail
 [ $# -lt 1 ] && { echo "usage: bb-recon <program>"; exit 1; }
 P="$1"; D="${TARGETS}/$P"; R="$D/recon"
 [ -s "$D/scope/roots.txt" ] || { echo "!! put root domains in $D/scope/roots.txt"; exit 1; }
-mkdir -p "$R"; cd "$R"
+mkdir -p "$R"; cd "$R" || { echo "!! cannot cd $R"; exit 1; }
 TS=$(date +%F_%H%M)
 
 echo "[1/5] passive subdomain enum (subfinder)"

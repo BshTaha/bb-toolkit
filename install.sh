@@ -155,7 +155,7 @@ if [ "$TOOLS_ONLY" = 0 ]; then
   say "nuclei templates"
   # nuclei's own -update-templates silently no-ops in a relocated install;
   # fetch the tarball directly instead.
-  mkdir -p "$BB/data/templates" && cd "$BB/data/templates"
+  mkdir -p "$BB/data/templates" && cd "$BB/data/templates" || die "cannot cd templates dir"
   if curl "${CURL_OPTS[@]}" -C - -o nt.tar.gz \
       "https://codeload.github.com/projectdiscovery/nuclei-templates/tar.gz/refs/heads/main"; then
     rm -rf nuclei-templates && tar -xzf nt.tar.gz \
@@ -164,7 +164,7 @@ if [ "$TOOLS_ONLY" = 0 ]; then
   else
     warn "template download failed"
   fi
-  cd "$BB"
+  cd "$BB" || die "cannot cd $BB"
 
   say "resolvers"
   curl "${CURL_OPTS[@]}" -o "$BB/data/resolvers/resolvers.txt" \

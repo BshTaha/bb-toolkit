@@ -7,7 +7,8 @@
 
 # $BB is wherever this file lives, so the checkout is relocatable.
 _bb_src="${BASH_SOURCE[0]:-$0}"
-export BB="$(cd "$(dirname "$(readlink -f "$_bb_src")")" && pwd)"
+BB="$(cd "$(dirname "$(readlink -f "$_bb_src")")" && pwd)" || return 1 2>/dev/null || exit 1
+export BB
 unset _bb_src
 
 # --- Go toolchain (self-contained) ---
@@ -44,6 +45,6 @@ alias bbn='cd $NOTES'
 alias bbl='cd $LOOT'
 
 # jump to (or create) a program workspace:  prog acme.com
-prog() { mkdir -p "$TARGETS/$1"/{scope,recon,urls,scans,screenshots,loot,notes,state} && cd "$TARGETS/$1"; }
+prog() { mkdir -p "$TARGETS/$1"/{scope,recon,urls,scans,screenshots,loot,notes,state} && cd "$TARGETS/$1" || return 1; }
 
 echo "[bb] env loaded -> $BB  (bin: $(ls "$BB/bin" 2>/dev/null | wc -l) tools)"
