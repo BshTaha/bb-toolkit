@@ -55,9 +55,15 @@ done < "$ROOTS"
 # ------------------------------------------------- 2. permutations (alterx)
 if [ "$PERMS" = 1 ] && [ -s "$D/recon/subdomains.txt" ]; then
   echo "  → generating permutations from $(wc -l < "$D/recon/subdomains.txt") known hosts"
-  # -limit bounds the combinatorial blowup on big scopes; timeout guards against
-  # alterx stalling on first-run config init and hanging the whole night's loop.
-  timeout 300 alterx -l "$D/recon/subdomains.txt" -limit "$PERMLIMIT" -silent 2>/dev/null \
+  # </dev/null is load-bearing, not tidiness. alterx ignores -l whenever stdin is
+  # a pipe: with data on stdin it silently discards -l and permutes the wrong
+  # input, and with stdin merely open-but-empty (which is what it inherits inside
+  # a script) it blocks forever. Redirecting stdin is what makes -l take effect.
+  # Reported upstream: https://github.com/projectdiscovery/alterx/issues/296
+  # -limit bounds the combinatorial blowup on big scopes; the timeout is a
+  # backstop for the unrelated pattern-generation hang (alterx#285).
+  timeout 300 alterx -l "$D/recon/subdomains.txt" -limit "$PERMLIMIT" -silent \
+    </dev/null 2>/dev/null \
     | sort -u > "$D/recon/.perms.txt" || echo "    [warn] alterx timed out — skipping permutations"
   echo "    $(wc -l < "$D/recon/.perms.txt") candidates — resolving"
   puredns resolve "$D/recon/.perms.txt" \

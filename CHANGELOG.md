@@ -34,8 +34,11 @@ and used against live HackerOne programs.
 
 ### Notes from building it
 - `gf` ignores `$GF_PATH` and only reads `~/.gf` — the installer symlinks it.
-- `alterx -limit 0` (its default) hangs forever; `bb-brute` always passes an
-  explicit limit plus a 300s timeout guard.
+- `alterx` ignores `-l` whenever stdin is a pipe — it silently discards the file
+  when stdin has data, and blocks forever when stdin is open but empty, which is
+  what it inherits inside a script. `bb-brute` redirects `</dev/null` so `-l`
+  takes effect. Reported upstream as
+  [alterx#296](https://github.com/projectdiscovery/alterx/issues/296).
 - `subzy` moved from `LukaSikic/subzy` to `PentestPad/subzy`.
 - nuclei's `-update-templates` silently no-ops in a relocated install; the
   installer fetches the template tarball directly.
