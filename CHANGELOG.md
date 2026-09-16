@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `tests/` — a local test harness proving `bb-verify` reports real flaws and
+  rejects traps. `vulnserver.py` returns HTTP 200 for every path with a body
+  containing every signature the file check matches on, so a naive scanner finds
+  five critical exposures where one exists. Stdlib only, no network.
+- CI now runs the suite on every push.
+
+### Verified
+- Assertions checked by mutation: deleting the soft-404 length guard produces
+  6 findings instead of 1 (2 tests fail); making the CORS check ignore
+  `Access-Control-Allow-Credentials` produces 2 instead of 1 (1 test fails).
+
 ## [0.1.0] — 2026-09-15
 
 First public release. Extracted from a private toolkit built over 2026-09-14/15

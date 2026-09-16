@@ -38,6 +38,17 @@ jobs:
             echo "  $f"; python3 -m py_compile "$f"
           done
 
+  tests:
+    name: verify tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: bb-verify against the local vulnerable server
+        run: python3 -W error::ResourceWarning tests/test_verify.py
+
   smoke:
     name: smoke
     runs-on: ubuntu-latest

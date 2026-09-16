@@ -82,6 +82,24 @@ bruteforce, and again after probing.
 
 ---
 
+## Tests
+
+```bash
+python3 tests/test_verify.py
+```
+
+The claim above — that it proves findings rather than reporting candidates — is
+checkable. `tests/vulnserver.py` is a server that returns HTTP 200 for every
+path, with a body containing the exact signatures bb-verify matches on. A scanner
+checking status and signature alone reports **five critical exposures** against
+it; all five are fiction, and exactly one file is genuinely exposed.
+
+The suite asserts both directions: every trap rejected, every real flaw still
+caught. Details, including the mutation testing used to confirm the assertions
+have teeth, are in [`tests/README.md`](tests/README.md).
+
+---
+
 ## The scripts
 
 | Script | What it does |
