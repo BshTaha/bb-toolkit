@@ -9,6 +9,13 @@ verified findings to Discord.
 
 No sudo. Nothing installed system-wide. Delete the folder and the environment is gone.
 
+![bb-toolkit rejecting soft-404s and confirming a real exposure](docs/img/demo.gif)
+
+*Above: a server answering HTTP 200 for every path. Five files appear exposed and
+none of them exist. bb-verify reports the one that does.* Everything shown runs
+against `tests/vulnserver.py` on localhost — reproduce it with
+`bash tests/demo.sh`.
+
 ```
 recon → scope-filter → urls → js secrets → VERIFY → nuclei → triage → Discord
                          ↑                                              │

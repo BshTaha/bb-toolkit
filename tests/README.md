@@ -55,6 +55,27 @@ The **takeover** check needs live DNS — it shells out to `dig` and resolves CN
 targets to decide whether one is dangling. Testing it honestly needs a DNS
 fixture; until that exists it is exercised only in the field, not here.
 
+## The recording
+
+`demo.sh` is the scripted demo used for the README GIF. Every command in it is
+really run against vulnserver on localhost:
+
+```bash
+bash tests/demo.sh
+```
+
+To re-record it:
+
+```bash
+asciinema rec --cols 98 --rows 40 -c "bash tests/demo.sh" demo.cast
+agg --theme asciinema --font-family "DejaVu Sans Mono" --font-size 15 \
+    --fps-cap 10 --idle-time-limit 1.5 --line-height 1.35 \
+    demo.cast docs/img/demo.gif
+```
+
+Use a font without programming ligatures — Fira Code renders `&&` as a single
+glyph that reads as mojibake in the GIF.
+
 ## Poking at the server by hand
 
 ```bash
