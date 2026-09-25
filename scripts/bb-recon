@@ -1,26 +1,57 @@
 #!/usr/bin/env bash
-# bb-recon <program>  — subdomain enum -> resolve -> live hosts -> tech/ports
+# bb-recon <program> [--ports]  — subdomain enum -> resolve -> live hosts -> ports
 # Reads  targets/<program>/scope/roots.txt
+#
+# HTTP probing honours the program's profile.env (rate/UA/header) when present.
+# The naabu port scan is OFF by default (opt in with --ports or BB_ALLOW_PORTSCAN=1)
+# because a top-1000 scan is active traffic many programs forbid.
 set -uo pipefail
-[ $# -lt 1 ] && { echo "usage: bb-recon <program>"; exit 1; }
-P="$1"; D="${TARGETS}/$P"; R="$D/recon"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/bb-common.sh"
+
+PORTSCAN="${BB_ALLOW_PORTSCAN:-0}"
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --ports) PORTSCAN=1 ;;
+    -*) echo "unknown option: $a"; exit 1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+set -- "${ARGS[@]}"
+[ $# -lt 1 ] && { echo "usage: bb-recon <program> [--ports]"; exit 1; }
+P="$1"; D="${TARGETS:?source ~/bugbounty/env.sh first}/$P"; R="$D/recon"
 [ -s "$D/scope/roots.txt" ] || { echo "!! put root domains in $D/scope/roots.txt"; exit 1; }
+need subfinder dnsx httpx || exit 1
 mkdir -p "$R"; cd "$R" || { echo "!! cannot cd $R"; exit 1; }
 TS=$(date +%F_%H%M)
+
+# Request policy: httpx probing is ACTIVE traffic, so it must respect the cap.
+# No profile => warn and fall back to conservative defaults (not the old 150/50).
+load_profile "$P"
+if [ "$PROFILE_FOUND" = 1 ]; then
+  echo "[profile] httpx rate=${RATE}/s threads=${THREADS} headers=${#UA_ARGS[@]}"
+else
+  RATE=50; THREADS=20
+  echo "[warn] no scope/profile.env — probing at a conservative ${RATE}/s with a default UA."
+  echo "       Create one before scanning:  bb-profile $P init"
+fi
 
 echo "[1/5] passive subdomain enum (subfinder)"
 subfinder -dL "$D/scope/roots.txt" -all -silent -o subs_subfinder.txt
 
 echo "[2/5] merging + resolving (dnsx)"
 cat subs_*.txt 2>/dev/null | anew subdomains.txt >/dev/null
+scope_filter "$P" subdomains.txt
 wc -l < subdomains.txt | xargs echo "    total unique subdomains:"
 dnsx -l subdomains.txt -r "$RESOLVERS" -silent -a -resp -o resolved.txt 2>/dev/null
 cut -d' ' -f1 resolved.txt 2>/dev/null | sort -u > resolved_hosts.txt
+scope_filter "$P" resolved_hosts.txt
 
 echo "[3/5] probing live hosts (httpx)"
-httpx -l resolved_hosts.txt -silent -sc -title -tech-detect -cl -location \
-      -threads 50 -rl 150 -timeout 8 -retries 1 -o live_full.txt
+httpx "${UA_ARGS[@]}" -l resolved_hosts.txt -silent -sc -title -tech-detect -cl -location \
+      -threads "$THREADS" -rl "$RATE" -timeout 8 -retries 1 -o live_full.txt
 grep -oE '^https?://[^ ]+' live_full.txt | sort -u > live.txt
+scope_filter "$P" live.txt
 wc -l < live.txt | xargs echo "    live hosts:"
 
 echo "[4/5] new-since-last-run diff"
@@ -29,7 +60,11 @@ comm -13 <(sort .baseline_subs.txt) <(sort subdomains.txt) > new_${TS}.txt
 [ -s new_${TS}.txt ] && echo "    !! NEW: $(wc -l < new_${TS}.txt)" || rm -f new_${TS}.txt
 cp subdomains.txt .baseline_subs.txt
 
-echo "[5/5] port scan on resolved (naabu, top ports)"
-naabu -l resolved_hosts.txt -top-ports 1000 -silent -rate 1000 -o ports.txt 2>/dev/null
+if [ "$PORTSCAN" = 1 ]; then
+  echo "[5/5] port scan on resolved (naabu, top 1000)"
+  need naabu && naabu -l resolved_hosts.txt -top-ports 1000 -silent -rate 1000 -o ports.txt 2>/dev/null
+else
+  echo "[5/5] port scan SKIPPED (active traffic) — re-run with --ports if the program allows it"
+fi
 
-echo "[done] $R  — live.txt / live_full.txt / ports.txt"
+echo "[done] $R  — live.txt / live_full.txt$([ "$PORTSCAN" = 1 ] && echo ' / ports.txt')"

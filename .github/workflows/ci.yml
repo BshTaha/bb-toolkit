@@ -19,9 +19,12 @@ jobs:
           set -e
           files=$(grep -rlE '^#!/usr/bin/env bash' scripts install.sh env.sh)
           echo "linting: $files"
-          # SC1090/SC1091: sourced paths are runtime-resolved
+          # SC1090/SC1091: sourced paths are runtime-resolved (shared lib/bb-common.sh)
           # SC2086: word splitting is intentional in the tool-flag paths
-          shellcheck -e SC1090,SC1091,SC2086 -S warning $files
+          # SC2154/SC2034: the request-policy vars (RATE/THREADS/UA_ARGS/PROFILE_FOUND)
+          #   are set by the sourced lib/bb-common.sh and consumed by the callers —
+          #   a cross-file relation shellcheck can't see without --external-sources
+          shellcheck -e SC1090,SC1091,SC2086,SC2154,SC2034 -S warning $files
 
   python:
     name: python syntax
@@ -48,6 +51,8 @@ jobs:
           python-version: "3.11"
       - name: bb-verify against the local vulnerable server
         run: python3 -W error::ResourceWarning tests/test_verify.py
+      - name: request-policy layer (bb-common / bb-scan / regressions)
+        run: bash tests/test_policy.sh
 
   smoke:
     name: smoke

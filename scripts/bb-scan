@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# bb-scan <program> [severity]  — nuclei against live hosts. Respect program rate limits!
+# bb-scan <program> [severity]  — nuclei against live hosts, under the program's
+# own rate/UA/header policy. Refuses to run without a profile.env, because a
+# fixed rate against an unknown cap is exactly how an account gets banned.
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib/bb-common.sh"
 [ $# -lt 1 ] && { echo "usage: bb-scan <program> [low,medium,high,critical]"; exit 1; }
 P="$1"; SEV="${2:-low,medium,high,critical}"
-D="${TARGETS}/$P"; S="$D/scans"; mkdir -p "$S"
+D="${TARGETS:?source ~/bugbounty/env.sh first}/$P"; S="$D/scans"; mkdir -p "$S"
 [ -s "$D/recon/live.txt" ] || { echo "!! run bb-recon first"; exit 1; }
+require_profile "$P" || exit 1
+need nuclei || exit 1
 TS=$(date +%F_%H%M)
-echo "[*] nuclei -severity $SEV on $(wc -l < "$D/recon/live.txt") hosts (rate-limited to 100/s)"
-nuclei -l "$D/recon/live.txt" -t "$NUCLEI_TEMPLATES" -severity "$SEV" \
-  -rl 100 -c 25 -timeout 8 -retries 1 -stats -si 60 \
+echo "[*] nuclei -severity $SEV on $(wc -l < "$D/recon/live.txt") hosts  (rate=${RATE}/s threads=${THREADS}, UA/header from profile.env)"
+nuclei "${UA_ARGS[@]}" -l "$D/recon/live.txt" -t "$NUCLEI_TEMPLATES" -severity "$SEV" \
+  -rl "$RATE" -c "$THREADS" -timeout 8 -retries 1 -stats -si 60 \
   -eid ssl-issuer,tech-detect,waf-detect \
   -o "$S/nuclei_${TS}.txt"
 echo "[done] $S/nuclei_${TS}.txt"

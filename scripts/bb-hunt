@@ -54,6 +54,9 @@ if [ -s "$D/scope/profile.env" ]; then
   . "$D/scope/profile.env"
   if [ -n "${BB_UA:-}" ]; then
     UA_ARGS=(-H "User-Agent: $BB_UA")
+    # Export it so child tools (bb-verify, bb-secrets) send the mandated UA too,
+    # not just bb-hunt's own httpx/nuclei calls.
+    export BB_UA
     echo "[profile] UA: $BB_UA"
   fi
   [ -n "${BB_RATE:-}" ] && RATE="${BB_RATE}"
@@ -64,7 +67,13 @@ LOCK="$D/state/hunt.lock"
 if [ -e "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
   echo "!! already hunting $P (pid $(cat "$LOCK"))"; exit 1
 fi
-echo $$ > "$LOCK"; trap 'rm -f "$LOCK"' EXIT INT TERM
+echo $$ > "$LOCK"
+# EXIT cleans up the lock on any normal termination. INT/TERM must ALSO exit:
+# the old combined trap ran `rm -f` but not `exit`, so Ctrl-C on a --loop hunt
+# deleted the lock yet kept hammering the target, and the missing lock let a
+# second invocation start a concurrent, rate-doubling run.
+trap 'rm -f "$LOCK"' EXIT
+trap 'echo; echo "[hunt] interrupted — stopping."; rm -f "$LOCK"; exit 130' INT TERM
 
 say(){ printf '\n\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 report(){ [ "$DISCORD" = 1 ] && bb-report "$P" --min "$MIN" ${PING:+--ping "$PING"} || true; }

@@ -173,12 +173,12 @@ exclusions after probing, then triages and reports.
 | Command | Does |
 |---|---|
 | `bb-new <prog> [domain...]` | Scaffold the workspace and a notes template |
-| `bb-recon <prog>` | subfinder → dnsx → httpx → naabu, with a new-since-last-run diff |
+| `bb-recon <prog> [--ports]` | subfinder → dnsx → httpx (profile rate/UA) → new-since-last-run diff. The `naabu` port scan is opt-in via `--ports` (or `BB_ALLOW_PORTSCAN=1`); out-of-scope filtering is applied throughout |
 | `bb-urls <prog>` | gau + katana → uro dedupe → buckets: `params`, `js`, `interesting_files`, and `idor`/`ssrf`/`lfi`/`xss`/`openredirect` candidates |
-| `bb-secrets <prog>` | Download every JS file; mine secrets, cloud refs, endpoints |
+| `bb-secrets <prog>` | Download every JS file (profile UA + mandated headers); mine secrets, cloud refs, endpoints |
 | `bb-gf <prog>` | Run every gf pattern over the collected URLs |
-| `bb-takeover <prog>` | subzy + nuclei takeover templates |
-| `bb-scan <prog> [sev]` | Rate-limited nuclei over live hosts |
+| `bb-takeover <prog>` | nuclei takeover templates (profile-driven) + subzy; subzy is skipped when the program mandates an identifying UA/header |
+| `bb-scan <prog> [sev]` | nuclei over live hosts at the program's rate/UA; refuses to run without a `scope/profile.env` |
 | `bb-findings [prog]` | Colourised review. `--min`, `--cls`, `--full` |
 | `bb-update` | Update every tool, template, wordlist and the resolver list |
 

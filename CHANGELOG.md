@@ -1,18 +1,49 @@
 # Changelog
 
-## Unreleased
+## [0.2.0] — 2026-09-25
+
+A compliance and correctness pass. The commands that generate traffic now take
+their rate, User-Agent and mandated headers from the program's `profile.env`
+through one shared loader instead of hardcoding them — closing the gap where a
+few of the most-used commands ignored the very policy the toolkit exists to
+enforce. Plus the first test harness and CI.
 
 ### Added
-- `tests/` — a local test harness proving `bb-verify` reports real flaws and
-  rejects traps. `vulnserver.py` returns HTTP 200 for every path with a body
-  containing every signature the file check matches on, so a naive scanner finds
-  five critical exposures where one exists. Stdlib only, no network.
-- CI now runs the suite on every push.
+- `scripts/lib/bb-common.sh` — one shared request-policy path: `load_profile` /
+  `require_profile`, `profile_mandates_identity`, `need`, `say`, and a corrected
+  `scope_filter`. `bb-scan`, `bb-recon`, `bb-takeover` and `bb-secrets` source
+  it, so the safety-sensitive logic can no longer drift per script.
+- `tests/` — a local harness, stdlib only, no network. `test_verify.py` proves
+  `bb-verify` reports the one real flaw on a soft-404 `vulnserver.py` and rejects
+  all five traps a naive status+signature scanner fires on. `test_policy.sh`
+  proves the loader parses a profile, that `require_profile` and `bb-scan` refuse
+  to run without one, and guards the two fixed bugs below against regression.
+- CI runs shellcheck, `py_compile`, and both test suites on every push.
+
+### Fixed
+- `bb-scan`: refuses without a `profile.env`, and drives `-rl` / `-c` / UA /
+  header from it instead of a hardcoded 100 req/s and the default User-Agent.
+- `bb-recon`: HTTP probing honours the profile (rate / UA); the top-1000 `naabu`
+  port scan is now OFF by default (`--ports` or `BB_ALLOW_PORTSCAN=1`); and
+  out-of-scope filtering is applied to subdomains, resolved hosts and live hosts.
+- `bb-takeover`: skips `subzy` when the program mandates an identifying UA or
+  header (subzy cannot send one) and covers takeovers via the profile-driven
+  nuclei templates instead; nuclei's rate / UA now come from the profile.
+- `bb-secrets`: JS fetches carry the program's UA and mandated headers, and the
+  run aborts loudly if nothing downloaded instead of reporting success over an
+  empty directory.
+- `bb-hunt`: exports `BB_UA`, so `bb-verify` and `bb-secrets` send the mandated
+  UA and not just bb-hunt's own tool calls; and the INT/TERM trap now exits, so
+  Ctrl-C stops a `--loop` hunt instead of removing the lock and continuing to
+  send traffic unattended.
+- `bb-verify`: standalone runs load the program's `profile.env`, sending the
+  mandated UA / header and deriving a politeness delay from the rate cap —
+  matching what it already did when launched by `bb-hunt`.
 
 ### Verified
-- Assertions checked by mutation: deleting the soft-404 length guard produces
-  6 findings instead of 1 (2 tests fail); making the CORS check ignore
-  `Access-Control-Allow-Credentials` produces 2 instead of 1 (1 test fails).
+- The `bb-verify` assertions were checked by mutation: deleting the soft-404
+  length guard produces 6 findings instead of 1 (2 tests fail); making the CORS
+  check ignore `Access-Control-Allow-Credentials` produces 2 instead of 1.
 
 ## [0.1.0] — 2026-09-15
 

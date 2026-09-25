@@ -20,7 +20,35 @@ except ImportError:
 
 BB = os.environ.get("BB", os.path.expanduser("~/bugbounty"))
 TARGETS = os.environ.get("TARGETS", f"{BB}/targets")
-UA = "Mozilla/5.0 (compatible; bugbounty-recon)"
+UA = os.environ.get("BB_UA") or "Mozilla/5.0 (compatible; bugbounty-recon)"
+
+# Programs that mandate an identifying header (e.g. Stripchat's "HackerOne: <handle>")
+# need it on EVERY request this script makes, not just the ones the shell tools send.
+# Sourced from the program profile via the environment.
+EXTRA_HEADERS = {}
+for _v in (os.environ.get("BB_HEADER"), os.environ.get("BB_HEADER2")):
+    if _v and ":" in _v:
+        _k, _val = _v.split(":", 1)
+        EXTRA_HEADERS[_k.strip()] = _val.strip()
+
+
+def _load_profile_env(program):
+    """For standalone runs, populate os.environ from the program's profile.env so
+    this script sends the mandated UA/header and can honour the rate cap even when
+    it was not launched by bb-hunt. setdefault semantics => a parent hunt's already
+    exported values win over the file."""
+    p = f"{TARGETS}/{program}/scope/profile.env"
+    if not os.path.exists(p):
+        return
+    for line in open(p, errors="ignore"):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
 
 # A canary we do not control and which cannot receive data — purely a marker
 # that the redirect left the origin. Never point a live payload at a real host.
@@ -43,6 +71,7 @@ def fetch(url, headers=None, timeout=10, redirect=False, method="GET"):
     if RATE:
         time.sleep(RATE)
     h = {"User-Agent": UA}
+    h.update(EXTRA_HEADERS)
     h.update(headers or {})
 
     class NoRedir(urllib.request.HTTPRedirectHandler):
@@ -258,7 +287,7 @@ def load(p, limit=None):
 
 
 def main():
-    global RATE
+    global RATE, UA, EXTRA_HEADERS
     ap = argparse.ArgumentParser()
     ap.add_argument("program")
     ap.add_argument("--checks", default="all")
@@ -268,6 +297,28 @@ def main():
     ap.add_argument("--max", type=int, default=1500, help="cap candidates per check")
     a = ap.parse_args()
     RATE = a.rate
+
+    # Standalone compliance: load the program's request policy, rebuild the request
+    # identity (UA + mandated headers), and derive a per-request politeness delay
+    # from the program's req/s cap when the caller did not pass --rate. Under
+    # bb-hunt the UA/headers are already in the environment and --rate is supplied,
+    # so nothing here overrides them.
+    _load_profile_env(a.program)
+    UA = os.environ.get("BB_UA") or "Mozilla/5.0 (compatible; bugbounty-recon)"
+    EXTRA_HEADERS = {}
+    for _v in (os.environ.get("BB_HEADER"), os.environ.get("BB_HEADER2")):
+        if _v and ":" in _v:
+            _k, _val = _v.split(":", 1)
+            EXTRA_HEADERS[_k.strip()] = _val.strip()
+    if RATE == 0.0 and os.environ.get("BB_RATE"):
+        try:
+            _bbr = float(os.environ["BB_RATE"])
+            if _bbr > 0:
+                RATE = round(a.threads / _bbr, 3)
+                print(f"[verify] rate cap: BB_RATE={_bbr}/s across {a.threads} threads "
+                      f"-> {RATE}s/request")
+        except ValueError:
+            pass
 
     d = f"{TARGETS}/{a.program}"
     if not os.path.isdir(d):
